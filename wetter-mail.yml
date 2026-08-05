@@ -1,0 +1,32 @@
+name: Wetter-Mail
+
+on:
+  schedule:
+    # Uhrzeiten in UTC! 6:00 UTC = 7/8 Uhr deutscher Zeit, 17:00 UTC = 18/19 Uhr
+    # (je nach Sommer-/Winterzeit). Bei Bedarf anpassen.
+    - cron: "0 6 * * *"
+    - cron: "0 17 * * *"
+  workflow_dispatch: {}  # erlaubt manuelles Auslösen über den "Run workflow" Button
+
+jobs:
+  send-weather-mail:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Wetter-Mail versenden
+        env:
+          WETTER_ORT: ${{ secrets.WETTER_ORT }}
+          GMAIL_ADRESSE: ${{ secrets.GMAIL_ADRESSE }}
+          GMAIL_APP_PASSWORT: ${{ secrets.GMAIL_APP_PASSWORT }}
+          WETTER_EMPFAENGER: ${{ secrets.WETTER_EMPFAENGER }}
+        run: python wetter_mail.py
