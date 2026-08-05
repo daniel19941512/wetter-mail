@@ -52,6 +52,21 @@ EMPFAENGER = os.environ.get("WETTER_EMPFAENGER", "empfaenger@example.com")
 
 
 def geocode(ort: str):
+    """
+    Ortsname oder Postleitzahl -> (lat, lon, anzeigename).
+    Erkennt automatisch, ob ORT eine Postleitzahl ist (4-5 Ziffern, z.B. für
+    Deutschland/Österreich/Schweiz) und nutzt dann die PLZ-Suche über
+    Nominatim (OpenStreetMap), da die Open-Meteo Geocoding API keine
+    Postleitzahlen unterstützt. Bei normalen Ortsnamen wird weiterhin die
+    Open-Meteo Geocoding API genutzt.
+    """
+    ort = ort.strip()
+    if ort.isdigit() and 4 <= len(ort) <= 5:
+        return geocode_plz(ort)
+    return geocode_ortsname(ort)
+
+
+def geocode_ortsname(ort: str):
     """Ortsname -> (lat, lon, anzeigename) über Open-Meteo Geocoding API."""
     url = "https://geocoding-api.open-meteo.com/v1/search"
     r = requests.get(url, params={"name": ort, "count": 1, "language": "de"}, timeout=15)
@@ -62,6 +77,35 @@ def geocode(ort: str):
     treffer = data["results"][0]
     name = f"{treffer['name']}, {treffer.get('country', '')}".strip(", ")
     return treffer["latitude"], treffer["longitude"], name
+
+
+def geocode_plz(plz: str):
+    """Postleitzahl -> (lat, lon, anzeigename) über Nominatim (OpenStreetMap)."""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "postalcode": plz,
+        "format": "json",
+        "addressdetails": 1,
+        "limit": 1,
+    }
+    headers = {"User-Agent": "WetterMail/1.0 (privates Automatisierungsskript)"}
+    r = requests.get(url, params=params, headers=headers, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        raise ValueError(
+            f"Postleitzahl '{plz}' wurde nicht gefunden. Bitte ORT in der Konfiguration prüfen "
+            "(funktioniert für Deutschland, Österreich und die Schweiz)."
+        )
+    treffer = data[0]
+    adresse = treffer.get("address", {})
+    ortsname = (
+        adresse.get("city") or adresse.get("town") or adresse.get("village")
+        or adresse.get("municipality") or adresse.get("county") or plz
+    )
+    land = adresse.get("country", "")
+    name = f"{ortsname} ({plz}), {land}".strip(", ")
+    return float(treffer["lat"]), float(treffer["lon"]), name
 
 
 def hole_wetterdaten(lat: float, lon: float):
