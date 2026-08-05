@@ -87,6 +87,7 @@ def geocode_plz(plz: str):
         "format": "json",
         "addressdetails": 1,
         "limit": 1,
+        "countrycodes": "de,at,ch",  # nur Deutschland, Österreich, Schweiz
     }
     headers = {"User-Agent": "WetterMail/1.0 (privates Automatisierungsskript)"}
     r = requests.get(url, params=params, headers=headers, timeout=15)
