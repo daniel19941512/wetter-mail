@@ -34,11 +34,11 @@ import matplotlib.pyplot as plt
 # GitHub Secrets (Umgebungsvariablen) - dann müssen die Zeilen unten
 # NICHT verändert werden, siehe README Abschnitt "GitHub Actions".
 
-ORT = os.environ.get("WETTER_ORT", "Berlin")  # <-- Stadtname, z.B. "München"
+ORT = os.environ.get("WETTER_ORT", "Ebringen")  # <-- Stadtname, z.B. "München"
 
-GMAIL_ADRESSE = os.environ.get("GMAIL_ADRESSE", "deine.adresse@gmail.com")
-GMAIL_APP_PASSWORT = os.environ.get("GMAIL_APP_PASSWORT", "xxxx xxxx xxxx xxxx")
-EMPFAENGER = os.environ.get("WETTER_EMPFAENGER", "empfaenger@example.com")
+GMAIL_ADRESSE = os.environ.get("GMAIL_ADRESSE", "danieladler1994@gmail.com")
+GMAIL_APP_PASSWORT = os.environ.get("GMAIL_APP_PASSWORT", "zanxflsddrsnoljn")
+EMPFAENGER = os.environ.get("WETTER_EMPFAENGER", "schumacherdaniel1994@gmail.com")
 
 # ============================================================
 
