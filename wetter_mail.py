@@ -2,14 +2,14 @@
 """
 Wetter-Mail
 -----------
-Holt aktuelle Wetterdaten (inkl. Taupunkt), eine Wetterkarte, einen
-Modellvergleich (GFS/ECMWF/AIFS/ICON) für 7 Tage sowie einen Langfrist-Trend
-und verschickt alles per Gmail als HTML-Mail. Gedacht für den Aufruf
-3x täglich über GitHub Actions, Task Scheduler oder Cron.
+Holt aktuelle Wetterdaten (inkl. Taupunkt), einen Modellvergleich
+(GFS/ECMWF/AIFS/ICON) für 7 Tage mit Diagrammen, einen Taupunktverlauf sowie
+einen Langfrist-Trend und verschickt alles per Gmail als HTML-Mail. Gedacht
+für den Aufruf 3x täglich über GitHub Actions, Task Scheduler oder Cron.
 
 Genutzte APIs (alle kostenlos, kein API-Key nötig):
 - Open-Meteo Geocoding + Forecast API + Seasonal API: https://open-meteo.com
-- OpenStreetMap-Kacheln: https://tile.openstreetmap.org
+- Nominatim (OpenStreetMap) für Postleitzahlen-Suche: https://nominatim.org
 
 Hinweis Langfrist-Trend: NOAA CFS wird von Open-Meteo nicht angeboten.
 Stattdessen wird ECMWF EC46 (bis 46 Tage) / SEAS5 (bis 9 Monate) genutzt,
@@ -21,15 +21,12 @@ import ssl
 import sys
 import tempfile
 import os
-import math
-import io
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 
 import requests
-from PIL import Image, ImageDraw
 import matplotlib
 matplotlib.use("Agg")  # kein Display nötig, wichtig für Cron/Task Scheduler
 import matplotlib.pyplot as plt
@@ -110,7 +107,7 @@ def geocode_plz(plz: str):
 
 
 def hole_wetterdaten(lat: float, lon: float):
-    """Aktuelle Werte (inkl. Taupunkt) + stündliche Vorhersage (48h) über Open-Meteo."""
+    """Aktuelle Werte (inkl. Taupunkt) + stündliche Vorhersage (7 Tage) über Open-Meteo."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -120,7 +117,7 @@ def hole_wetterdaten(lat: float, lon: float):
         "hourly": "temperature_2m,precipitation,precipitation_probability,dew_point_2m",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,"
                  "sunrise,sunset,weathercode",
-        "forecast_days": 3,
+        "forecast_days": 7,
         "timezone": "auto",
     }
     r = requests.get(url, params=params, timeout=15)
@@ -263,16 +260,17 @@ def baue_modellvergleich_tabelle(vergleich: dict) -> str:
     kopf = "<tr><th>Datum</th>"
     for name in MODELLE:
         kopf += f"<th colspan='2'>{name}</th>"
-    kopf += "<th>Niederschlag Ø</th></tr>"
+    kopf += "<th colspan='2'>Mittel aller Modelle</th><th>Niederschlag Ø</th></tr>"
     zeilen.append(kopf)
     zeilen.append(
-        "<tr><td></td>" + "<th>Max</th><th>Min (Nacht)</th>" * len(MODELLE) + "<td></td></tr>"
+        "<tr><td></td>" + "<th>Max</th><th>Min (Nacht)</th>" * len(MODELLE)
+        + "<th>Max</th><th>Min (Nacht)</th><td></td></tr>"
     )
 
     for i, tag in enumerate(tage):
         datum = datetime.fromisoformat(tag).strftime("%a %d.%m.")
         zeile = f"<tr><td><b>{datum}</b></td>"
-        niederschlag_werte = []
+        niederschlag_werte, max_werte, min_werte = [], [], []
         for suffix in MODELLE.values():
             max_key = f"temperature_2m_max_{suffix}"
             min_key = f"temperature_2m_min_{suffix}"
@@ -282,11 +280,20 @@ def baue_modellvergleich_tabelle(vergleich: dict) -> str:
             regen = daily.get(regen_key, [None] * len(tage))[i]
             if regen is not None:
                 niederschlag_werte.append(regen)
+            if max_t is not None:
+                max_werte.append(max_t)
+            if min_t is not None:
+                min_werte.append(min_t)
             max_txt = f"{max_t:.0f}°" if max_t is not None else "-"
             min_txt = f"{min_t:.0f}°" if min_t is not None else "-"
             # Kälteste Nächte (< 5°C) hervorheben
             min_style = ' style="color:#1a5fb4; font-weight:bold;"' if (min_t is not None and min_t < 5) else ""
             zeile += f"<td>{max_txt}</td><td{min_style}>{min_txt}</td>"
+
+        mittel_max = f"{sum(max_werte)/len(max_werte):.0f}°" if max_werte else "-"
+        mittel_min = f"{sum(min_werte)/len(min_werte):.0f}°" if min_werte else "-"
+        zeile += f"<td><b>{mittel_max}</b></td><td><b>{mittel_min}</b></td>"
+
         regen_avg = f"{sum(niederschlag_werte)/len(niederschlag_werte):.1f} mm" if niederschlag_werte else "-"
         zeile += f"<td>{regen_avg}</td></tr>"
         zeilen.append(zeile)
@@ -295,49 +302,66 @@ def baue_modellvergleich_tabelle(vergleich: dict) -> str:
         "<table cellpadding='4' style='border-collapse:collapse; font-size:13px;' border='1'>"
         + "".join(zeilen) + "</table>"
         + "<p style='color:#888; font-size:11px;'>Min-Werte unter 5°C sind hervorgehoben "
-          "(relevant für Nachtfrost-Risiko). Niederschlag Ø = Mittelwert über alle vier Modelle.</p>"
+          "(relevant für Nachtfrost-Risiko). 'Mittel aller Modelle' und Niederschlag Ø = "
+          "Durchschnitt über alle vier Modelle.</p>"
     )
 
 
-def lade_karte(lat: float, lon: float, pfad: str, zoom: int = 10):
+def erstelle_modelltemperaturdiagramm(vergleich: dict, pfad: str):
     """
-    Baut eine Karte direkt aus offiziellen OpenStreetMap-Kacheln zusammen
-    (3x3-Kachelraster um den Standort). Braucht keinen API-Key und ist
-    unabhängig von Drittanbieter-Static-Map-Diensten, die häufig instabil
-    sind oder abgeschaltet werden.
+    Temperaturverlauf (Tages-Max) über 7 Tage, eine Linie je Modell, plus
+    horizontale Schwellenlinien für Hitze-Referenzwerte.
     """
-    def latlon_zu_kachel(lat, lon, zoom):
-        lat_rad = math.radians(lat)
-        n = 2.0 ** zoom
-        x = int((lon + 180.0) / 360.0 * n)
-        y = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
-        return x, y
+    daily = vergleich["daily"]
+    tage = [datetime.fromisoformat(t) for t in daily["time"]]
+    labels = [t.strftime("%a %d.%m.") for t in tage]
 
-    tile_groesse = 256
-    raster = 3  # 3x3 Kacheln
-    mitte = raster // 2
-    x0, y0 = latlon_zu_kachel(lat, lon, zoom)
+    farben = {"GFS": "#2e7d32", "ECMWF": "#1565c0", "AIFS": "#6a1b9a", "ICON": "#e65100"}
 
-    gesamt = Image.new("RGB", (tile_groesse * raster, tile_groesse * raster))
-    headers = {"User-Agent": "WetterMail/1.0 (privates Automatisierungsskript)"}
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for name, suffix in MODELLE.items():
+        werte = daily.get(f"temperature_2m_max_{suffix}")
+        if werte:
+            ax.plot(labels, werte, marker="o", linewidth=2, label=name,
+                    color=farben.get(name))
 
-    for dx in range(-mitte, mitte + 1):
-        for dy in range(-mitte, mitte + 1):
-            x, y = x0 + dx, y0 + dy
-            url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
-            r = requests.get(url, headers=headers, timeout=15)
-            r.raise_for_status()
-            kachel = Image.open(io.BytesIO(r.content))
-            gesamt.paste(kachel, ((dx + mitte) * tile_groesse, (dy + mitte) * tile_groesse))
+    # Schwellenlinien
+    schwellen = [(20, "blue", "20°C"), (30, "gold", "30°C"),
+                 (35, "red", "35°C"), (40, "purple", "40°C")]
+    for wert, farbe, label in schwellen:
+        ax.axhline(wert, color=farbe, linestyle="--", linewidth=1, alpha=0.7)
+        ax.text(len(labels) - 1, wert, f" {label}", color=farbe, fontsize=9, va="bottom")
 
-    # Roten Punkt als Markierung für den Standort in die Bildmitte zeichnen
-    zeichner = ImageDraw.Draw(gesamt)
-    cx, cy = gesamt.width // 2, gesamt.height // 2
-    radius = 8
-    zeichner.ellipse((cx - radius, cy - radius, cx + radius, cy + radius),
-                      fill="red", outline="white", width=2)
+    ax.set_title("7-Tage-Temperaturverlauf im Modellvergleich (Tagesmaximum)")
+    ax.set_ylabel("Temperatur (°C)")
+    ax.legend(loc="upper left", fontsize=9)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(pfad, dpi=120)
+    plt.close(fig)
 
-    gesamt.save(pfad)
+
+def erstelle_taupunktdiagramm(daten: dict, pfad: str):
+    """Taupunktverlauf über den kompletten abgerufenen Zeitraum (bis zu 7 Tage), mit Schwellenlinien."""
+    hourly = daten["hourly"]
+    zeiten = [datetime.fromisoformat(t) for t in hourly["time"]]
+    taupunkt = hourly["dew_point_2m"]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(zeiten, taupunkt, color="#00838f", linewidth=1.5, label="Taupunkt (°C)")
+
+    schwellen = [(16, "red", "16°C"), (20, "purple", "20°C")]
+    for wert, farbe, label in schwellen:
+        ax.axhline(wert, color=farbe, linestyle="--", linewidth=1, alpha=0.7)
+        ax.text(zeiten[-1], wert, f" {label}", color=farbe, fontsize=9, va="bottom")
+
+    ax.set_title("Taupunktverlauf")
+    ax.set_ylabel("Taupunkt (°C)")
+    ax.set_xlabel("Datum")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(pfad, dpi=120)
+    plt.close(fig)
 
 
 def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: bool) -> str:
@@ -374,12 +398,14 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
         <tr><td>Niederschlag aktuell:</td><td>{cur['precipitation']} mm</td></tr>
         <tr><td>Sonnenaufgang / -untergang:</td><td>{sonnenaufgang} / {sonnenuntergang}</td></tr>
       </table>
-      <h3>Karte</h3>
-      <img src="cid:karte" width="600"><br><br>
       <h3>Verlauf nächste 24h</h3>
       <img src="cid:diagramm" width="600">
       <h3>7-Tage-Modellvergleich (GFS / ECMWF / AIFS / ICON)</h3>
       {modellvergleich_html}
+      <h3>7-Tage-Temperaturverlauf im Modellvergleich</h3>
+      <img src="cid:modelltemp" width="600">
+      <h3>Taupunktverlauf</h3>
+      <img src="cid:taupunkt" width="600">
       {trend_block}
       <p style="color:#888; font-size:12px;">
         Automatisch erstellt am {datetime.now().strftime('%d.%m.%Y um %H:%M Uhr')}.
@@ -390,22 +416,24 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
     """
 
 
-def sende_mail(ort_name: str, html: str, karte_pfad: str, diagramm_pfad: str, trend_pfad: str = None):
+def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: str,
+                taupunkt_pfad: str, trend_pfad: str = None):
     msg = MIMEMultipart("related")
     msg["Subject"] = f"Wetter-Update {ort_name} - {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     msg["From"] = GMAIL_ADRESSE
     msg["To"] = EMPFAENGER
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    with open(karte_pfad, "rb") as f:
-        bild = MIMEImage(f.read())
-        bild.add_header("Content-ID", "<karte>")
-        msg.attach(bild)
-
-    with open(diagramm_pfad, "rb") as f:
-        bild = MIMEImage(f.read())
-        bild.add_header("Content-ID", "<diagramm>")
-        msg.attach(bild)
+    bilder = [
+        (diagramm_pfad, "diagramm"),
+        (modelltemp_pfad, "modelltemp"),
+        (taupunkt_pfad, "taupunkt"),
+    ]
+    for pfad, cid in bilder:
+        with open(pfad, "rb") as f:
+            bild = MIMEImage(f.read())
+            bild.add_header("Content-ID", f"<{cid}>")
+            msg.attach(bild)
 
     if trend_pfad and os.path.exists(trend_pfad):
         with open(trend_pfad, "rb") as f:
@@ -428,12 +456,14 @@ def main():
         modellvergleich_html = baue_modellvergleich_tabelle(vergleich)
 
         tmp = tempfile.gettempdir()
-        karte_pfad = os.path.join(tmp, "wetter_karte.png")
         diagramm_pfad = os.path.join(tmp, "wetter_diagramm.png")
+        modelltemp_pfad = os.path.join(tmp, "wetter_modelltemp.png")
+        taupunkt_pfad = os.path.join(tmp, "wetter_taupunkt.png")
         trend_pfad = os.path.join(tmp, "wetter_trend.png")
 
-        lade_karte(lat, lon, karte_pfad)
         erstelle_diagramm(daten, diagramm_pfad)
+        erstelle_modelltemperaturdiagramm(vergleich, modelltemp_pfad)
+        erstelle_taupunktdiagramm(daten, taupunkt_pfad)
 
         # Langfrist-Trend ist optional: schlägt diese API mal fehl, soll die
         # restliche Mail trotzdem verschickt werden.
@@ -446,7 +476,7 @@ def main():
             print(f"Hinweis: Langfrist-Trend konnte nicht geladen werden: {e}", file=sys.stderr)
 
         html = baue_html(ort_name, daten, modellvergleich_html, hat_trend)
-        sende_mail(ort_name, html, karte_pfad, diagramm_pfad,
+        sende_mail(ort_name, html, diagramm_pfad, modelltemp_pfad, taupunkt_pfad,
                    trend_pfad if hat_trend else None)
         print(f"Wetter-Mail für {ort_name} erfolgreich versendet.")
     except Exception as e:
