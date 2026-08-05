@@ -252,6 +252,9 @@ def baue_modellvergleich_tabelle(vergleich: dict) -> str:
         + "<p style='color:#888; font-size:11px;'>Min-Werte unter 5°C sind hervorgehoben "
           "(relevant für Nachtfrost-Risiko). Niederschlag Ø = Mittelwert über alle vier Modelle.</p>"
     )
+
+
+def lade_karte(lat: float, lon: float, pfad: str, zoom: int = 10):
     """
     Baut eine Karte direkt aus offiziellen OpenStreetMap-Kacheln zusammen
     (3x3-Kachelraster um den Standort). Braucht keinen API-Key und ist
