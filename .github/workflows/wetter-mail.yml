@@ -2,10 +2,17 @@ name: Wetter-Mail
 
 on:
   schedule:
-    # Uhrzeiten in UTC! 6:00 UTC = 7/8 Uhr deutscher Zeit, 17:00 UTC = 18/19 Uhr
-    # (je nach Sommer-/Winterzeit). Bei Bedarf anpassen.
-    - cron: "0 6 * * *"
-    - cron: "0 17 * * *"
+    # Uhrzeiten in UTC! Aktuell Sommerzeit (CEST = UTC+2), daher:
+    # 4:30 UTC  -> 6:30 Uhr deutsche Zeit
+    # 10:30 UTC -> 12:30 Uhr deutsche Zeit
+    # 16:30 UTC -> 18:30 Uhr deutsche Zeit
+    # WICHTIG: Im Winter (CET = UTC+1) verschieben sich die deutschen Zeiten
+    # dadurch um 1h nach hinten (z.B. 7:30 statt 6:30). Für exakte Zeiten das
+    # ganze Jahr über müsste man 2x jährlich die cron-Werte um je 1h anpassen
+    # (Ende März / Ende Oktober, zur Zeitumstellung).
+    - cron: "30 4 * * *"
+    - cron: "30 10 * * *"
+    - cron: "30 16 * * *"
   workflow_dispatch: {}  # erlaubt manuelles Auslösen über den "Run workflow" Button
 
 jobs:
