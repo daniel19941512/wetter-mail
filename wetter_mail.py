@@ -16,12 +16,15 @@ import ssl
 import sys
 import tempfile
 import os
+import math
+import io
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 
 import requests
+from PIL import Image, ImageDraw
 import matplotlib
 matplotlib.use("Agg")  # kein Display nötig, wichtig für Cron/Task Scheduler
 import matplotlib.pyplot as plt
@@ -115,19 +118,45 @@ def erstelle_diagramm(daten: dict, pfad: str):
     plt.close(fig)
 
 
-def lade_karte(lat: float, lon: float, pfad: str):
-    """Statische OSM-Karte mit Marker am Standort (kein API-Key nötig)."""
-    url = "https://staticmap.openstreetmap.de/staticmap.php"
-    params = {
-        "center": f"{lat},{lon}",
-        "zoom": 10,
-        "size": "600x400",
-        "markers": f"{lat},{lon},red-pushpin",
-    }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    with open(pfad, "wb") as f:
-        f.write(r.content)
+def lade_karte(lat: float, lon: float, pfad: str, zoom: int = 10):
+    """
+    Baut eine Karte direkt aus offiziellen OpenStreetMap-Kacheln zusammen
+    (3x3-Kachelraster um den Standort). Braucht keinen API-Key und ist
+    unabhängig von Drittanbieter-Static-Map-Diensten, die häufig instabil
+    sind oder abgeschaltet werden.
+    """
+    def latlon_zu_kachel(lat, lon, zoom):
+        lat_rad = math.radians(lat)
+        n = 2.0 ** zoom
+        x = int((lon + 180.0) / 360.0 * n)
+        y = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+        return x, y
+
+    tile_groesse = 256
+    raster = 3  # 3x3 Kacheln
+    mitte = raster // 2
+    x0, y0 = latlon_zu_kachel(lat, lon, zoom)
+
+    gesamt = Image.new("RGB", (tile_groesse * raster, tile_groesse * raster))
+    headers = {"User-Agent": "WetterMail/1.0 (privates Automatisierungsskript)"}
+
+    for dx in range(-mitte, mitte + 1):
+        for dy in range(-mitte, mitte + 1):
+            x, y = x0 + dx, y0 + dy
+            url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+            r = requests.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            kachel = Image.open(io.BytesIO(r.content))
+            gesamt.paste(kachel, ((dx + mitte) * tile_groesse, (dy + mitte) * tile_groesse))
+
+    # Roten Punkt als Markierung für den Standort in die Bildmitte zeichnen
+    zeichner = ImageDraw.Draw(gesamt)
+    cx, cy = gesamt.width // 2, gesamt.height // 2
+    radius = 8
+    zeichner.ellipse((cx - radius, cy - radius, cx + radius, cy + radius),
+                      fill="red", outline="white", width=2)
+
+    gesamt.save(pfad)
 
 
 def baue_html(ort_name: str, daten: dict) -> str:
