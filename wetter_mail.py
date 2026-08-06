@@ -21,7 +21,9 @@ import ssl
 import sys
 import tempfile
 import os
-from datetime import datetime
+import csv
+import json
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -107,22 +109,237 @@ def geocode_plz(plz: str):
 
 
 def hole_wetterdaten(lat: float, lon: float):
-    """Aktuelle Werte (inkl. Taupunkt) + stündliche Vorhersage (7 Tage) über Open-Meteo."""
+    """Aktuelle Werte + stündliche + tägliche Vorhersage (7 Tage) über Open-Meteo."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
         "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
-                   "dew_point_2m,precipitation,weathercode,windspeed_10m",
-        "hourly": "temperature_2m,precipitation,precipitation_probability,dew_point_2m",
+                   "dew_point_2m,precipitation,weathercode,windspeed_10m,"
+                   "windgusts_10m,winddirection_10m,surface_pressure",
+        "hourly": "temperature_2m,precipitation,precipitation_probability,"
+                  "dew_point_2m,surface_pressure",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,"
-                 "sunrise,sunset,weathercode",
+                 "sunrise,sunset,weathercode,uv_index_max,sunshine_duration",
         "forecast_days": 7,
         "timezone": "auto",
     }
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
+
+
+HIMMELSRICHTUNGEN = ["N", "NNO", "NO", "ONO", "O", "OSO", "SO", "SSO",
+                      "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def windrichtung_text(grad: float) -> str:
+    """Windrichtung in Grad -> Himmelsrichtung (z.B. 'NW')."""
+    index = round(grad / 22.5) % 16
+    return HIMMELSRICHTUNGEN[index]
+
+
+def luftdruck_trend(hourly: dict) -> str:
+    """
+    Vergleicht den aktuellsten verfügbaren Luftdruckwert mit dem Wert von
+    vor 3 Stunden und gibt einen kurzen Trend-Text zurück.
+    """
+    werte = hourly.get("surface_pressure")
+    if not werte or len(werte) < 4:
+        return ""
+    # Index des letzten nicht-None Werts suchen (aktuellste Stunde)
+    aktueller_index = None
+    for i in range(len(werte) - 1, -1, -1):
+        if werte[i] is not None:
+            aktueller_index = i
+            break
+    if aktueller_index is None or aktueller_index < 3:
+        return ""
+    aktuell = werte[aktueller_index]
+    vorher = werte[aktueller_index - 3]
+    if aktuell is None or vorher is None:
+        return ""
+    diff = aktuell - vorher
+    if diff > 1:
+        pfeil = "steigend ↑"
+    elif diff < -1:
+        pfeil = "fallend ↓"
+    else:
+        pfeil = "gleichbleibend →"
+    return f"{aktuell:.0f} hPa ({pfeil}, {diff:+.1f} hPa/3h)"
+
+
+DWD_WARNSTUFEN = {
+    1: "Wetterwarnung",
+    2: "Markante Wetterwarnung",
+    3: "Unwetterwarnung",
+    4: "Extreme Unwetterwarnung",
+}
+
+
+def hole_dwd_warnungen(lat: float, lon: float):
+    """
+    Amtliche DWD-Unwetterwarnungen für den Landkreis/die Stadt am Standort.
+
+    Ablauf: 1) Kreis-/Stadtname per Nominatim-Reverse-Geocoding ermitteln,
+    2) passende DWD-Warncell-ID über die offizielle DWD-CSV-Liste finden,
+    3) aktuelle Warnungen über die DWD-JSON-Schnittstelle abrufen und nach
+    dieser ID filtern.
+
+    Rein optionales Feature - bei jedem Fehler wird einfach eine leere
+    Liste zurückgegeben (siehe try/except in main()), damit die restliche
+    Mail davon nicht betroffen ist.
+    """
+    headers = {"User-Agent": "WetterMail/1.0 (privates Automatisierungsskript)"}
+
+    # 1) Kreis/Stadt am Standort ermitteln
+    rev = requests.get(
+        "https://nominatim.openstreetmap.org/reverse",
+        params={"lat": lat, "lon": lon, "format": "json", "addressdetails": 1, "zoom": 8},
+        headers=headers, timeout=15,
+    )
+    rev.raise_for_status()
+    adresse = rev.json().get("address", {})
+    gesuchte_namen = [
+        adresse.get("county"), adresse.get("state_district"),
+        adresse.get("city"), adresse.get("town"),
+    ]
+    gesuchte_namen = [n for n in gesuchte_namen if n]
+    if not gesuchte_namen:
+        return []
+
+    def normalisiert(s: str) -> str:
+        ersetzungen = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
+        s = s.lower()
+        for a, b in ersetzungen.items():
+            s = s.replace(a, b)
+        return s
+
+    # 2) Warncell-ID über die DWD-CSV-Liste finden
+    csv_url = ("https://www.dwd.de/DE/leistungen/opendata/help/warnungen/"
+               "cap_warncellids_csv.csv?__blob=publicationFile&v=4")
+    csv_r = requests.get(csv_url, headers=headers, timeout=20)
+    csv_r.raise_for_status()
+    zeilen = csv_r.content.decode("latin-1").splitlines()
+    reader = csv.DictReader(zeilen, delimiter=";")
+    # Spaltennamen können variieren - passende Spalten robust suchen
+    felder = reader.fieldnames or []
+    id_spalte = next((f for f in felder if "WARNCELLID" in f.upper()), None)
+    name_spalte = next((f for f in felder if "NAME" in f.upper()), None)
+    if not id_spalte or not name_spalte:
+        return []
+
+    gesuchte_normalisiert = [normalisiert(n) for n in gesuchte_namen]
+    passende_id = None
+    for row in reader:
+        eintrag = normalisiert(row.get(name_spalte, ""))
+        if any(g and (g in eintrag or eintrag in g) for g in gesuchte_normalisiert):
+            passende_id = row.get(id_spalte, "").strip()
+            break
+    if not passende_id:
+        return []
+
+    # 3) Aktuelle Warnungen abrufen (JSONP, daher Präfix/Suffix entfernen)
+    warn_r = requests.get(
+        "https://www.dwd.de/DWD/warnungen/warnapp/json/warnings.json",
+        headers=headers, timeout=15,
+    )
+    warn_r.raise_for_status()
+    text = warn_r.text
+    start = text.find("{")
+    ende = text.rfind("}") + 1
+    warn_daten = json.loads(text[start:ende])
+
+    rohe_warnungen = warn_daten.get("warnings", {}).get(passende_id, [])
+    ergebnis = []
+    for w in rohe_warnungen:
+        ergebnis.append({
+            "headline": w.get("headline", ""),
+            "beschreibung": w.get("description", ""),
+            "level": w.get("level", 0),
+            "region": w.get("regionName", ""),
+        })
+    return ergebnis
+
+
+def baue_warnungen_html(warnungen: list) -> str:
+    """HTML-Block für DWD-Unwetterwarnungen (leer, wenn keine aktiv sind)."""
+    if not warnungen:
+        return "<p style='color:#2e7d32;'><b>Keine amtlichen DWD-Warnungen aktiv.</b></p>"
+
+    farben = {1: "#f9a825", 2: "#ef6c00", 3: "#c62828", 4: "#6a1b9a"}
+    bloecke = []
+    for w in warnungen:
+        farbe = farben.get(w["level"], "#c62828")
+        stufe = DWD_WARNSTUFEN.get(w["level"], "Warnung")
+        bloecke.append(
+            f"<div style='border-left:4px solid {farbe}; padding:6px 10px; margin:6px 0; "
+            f"background:#fafafa;'><b style='color:{farbe};'>{stufe}: {w['headline']}</b>"
+            f"<br><span style='font-size:13px;'>{w['beschreibung']}</span></div>"
+        )
+    return "".join(bloecke)
+
+
+def hole_klimavergleich(lat: float, lon: float, heute_max: float, heute_min: float):
+    """
+    Vergleicht die heutige Vorhersage mit den tatsächlichen Werten der
+    letzten 5 Jahre am selben Kalendertag (± 2 Tage Fenster) über die
+    kostenlose Open-Meteo Archiv-API. Kein echtes 30-Jahres-Klimanormal,
+    sondern eine grobe Einordnung "wärmer/kälter als in den Vorjahren".
+    Optionales Feature - Fehler werden in main() abgefangen.
+    """
+    heute = datetime.now()
+    alle_max, alle_min = [], []
+    for jahre_zurueck in range(1, 6):
+        ziel_jahr = heute.year - jahre_zurueck
+        try:
+            ziel_datum = heute.replace(year=ziel_jahr)
+        except ValueError:
+            continue  # 29. Februar in einem Jahr ohne Schaltjahr
+        start = (ziel_datum - timedelta(days=2)).strftime("%Y-%m-%d")
+        ende = (ziel_datum + timedelta(days=2)).strftime("%Y-%m-%d")
+        r = requests.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params={
+                "latitude": lat, "longitude": lon,
+                "start_date": start, "end_date": ende,
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "timezone": "auto",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        daily = r.json().get("daily", {})
+        alle_max += [v for v in daily.get("temperature_2m_max", []) if v is not None]
+        alle_min += [v for v in daily.get("temperature_2m_min", []) if v is not None]
+
+    if not alle_max or not alle_min:
+        return None
+
+    hist_max = sum(alle_max) / len(alle_max)
+    hist_min = sum(alle_min) / len(alle_min)
+    return {
+        "hist_max": hist_max, "hist_min": hist_min,
+        "anomalie_max": heute_max - hist_max, "anomalie_min": heute_min - hist_min,
+        "jahre": len(range(1, 6)),
+    }
+
+
+def baue_klimavergleich_html(vergleich: dict) -> str:
+    if not vergleich:
+        return ""
+    a_max, a_min = vergleich["anomalie_max"], vergleich["anomalie_min"]
+
+    def text(anomalie):
+        richtung = "wärmer" if anomalie >= 0 else "kälter"
+        return f"{abs(anomalie):.1f}°C {richtung}"
+
+    return (
+        f"<p>Im Vergleich zum Schnitt der letzten {vergleich['jahre']} Jahre "
+        f"(gleicher Kalendertag ± 2 Tage): Tagesmax {text(a_max)} "
+        f"(Ø damals {vergleich['hist_max']:.0f}°C), Nachtmin {text(a_min)} "
+        f"(Ø damals {vergleich['hist_min']:.0f}°C).</p>"
+    )
 
 
 # Modelle für den Vergleich: Name -> Open-Meteo Modell-String
@@ -364,13 +581,66 @@ def erstelle_taupunktdiagramm(daten: dict, pfad: str):
     plt.close(fig)
 
 
-def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: bool) -> str:
+def baue_klartext(daten: dict, vergleich: dict, warnungen: list) -> str:
+    """Regelbasierter Klartext-Bericht in einem Satz/Absatz (kein LLM, rein aus den Zahlen abgeleitet)."""
+    cur = daten["current"]
+    daily = daten["daily"]
+    heute_max = daily["temperature_2m_max"][0]
+    heute_min = daily["temperature_2m_min"][0]
+    regen_heute = daily["precipitation_sum"][0] if daily.get("precipitation_sum") else 0
+
+    teile = [f"{wettercode_text(cur['weathercode'])}, {heute_min:.0f}–{heute_max:.0f}°C."]
+
+    if regen_heute and regen_heute > 0.5:
+        teile.append(f"Mit ca. {regen_heute:.0f} mm Niederschlag ist heute zu rechnen.")
+    else:
+        teile.append("Kaum Niederschlag erwartet.")
+
+    if heute_min < 0:
+        teile.append("Nachts Frost möglich.")
+    elif heute_min < 5:
+        teile.append("Nachts kühl, im Bergland ggf. Bodenfrost.")
+
+    if heute_max >= 30:
+        teile.append("Deutliche Hitze am Tag - ausreichend trinken.")
+
+    # Wochentrend: Vergleich Ø Max erste vs. zweite Hälfte der Woche
+    max_werte = [v for v in daily.get("temperature_2m_max", []) if v is not None]
+    if len(max_werte) >= 6:
+        erste_haelfte = sum(max_werte[:3]) / 3
+        zweite_haelfte = sum(max_werte[3:6]) / 3
+        if zweite_haelfte - erste_haelfte > 2:
+            teile.append("Im Wochenverlauf wird es spürbar wärmer.")
+        elif erste_haelfte - zweite_haelfte > 2:
+            teile.append("Im Wochenverlauf kühlt es spürbar ab.")
+
+    if vergleich:
+        richtung = "wärmer" if vergleich["anomalie_max"] >= 0 else "kälter"
+        teile.append(f"Damit {abs(vergleich['anomalie_max']):.0f}°C {richtung} als in den Vorjahren üblich.")
+
+    if warnungen:
+        hoechste_stufe = max(w["level"] for w in warnungen)
+        teile.append(f"Achtung: {DWD_WARNSTUFEN.get(hoechste_stufe, 'Wetterwarnung')} aktiv, Details unten.")
+
+    return " ".join(teile)
+
+
+def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: bool,
+              warnungen: list, klimavergleich: dict) -> str:
     cur = daten["current"]
     daily = daten["daily"]
     heute_max = daily["temperature_2m_max"][0]
     heute_min = daily["temperature_2m_min"][0]
     sonnenaufgang = daily["sunrise"][0].split("T")[1]
     sonnenuntergang = daily["sunset"][0].split("T")[1]
+    uv_index = daily.get("uv_index_max", [None])[0]
+    sonnenschein_std = (daily.get("sunshine_duration", [0])[0] or 0) / 3600
+    luftdruck = luftdruck_trend(daten["hourly"])
+    windrichtung = windrichtung_text(cur["winddirection_10m"]) if cur.get("winddirection_10m") is not None else "-"
+
+    klartext = baue_klartext(daten, klimavergleich, warnungen)
+    warnungen_html = baue_warnungen_html(warnungen)
+    klimavergleich_html = baue_klimavergleich_html(klimavergleich)
 
     trend_block = ""
     if hat_trend:
@@ -387,17 +657,23 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
     <html>
     <body style="font-family: Arial, sans-serif; color:#222;">
       <h2>Wetter für {ort_name}</h2>
-      <p><b>{wettercode_text(cur['weathercode'])}</b></p>
+      <p style="font-size:15px;">{klartext}</p>
+      <h3>Amtliche Warnungen (DWD)</h3>
+      {warnungen_html}
       <table cellpadding="4">
         <tr><td>Aktuelle Temperatur:</td><td><b>{cur['temperature_2m']} °C</b>
             (gefühlt {cur['apparent_temperature']} °C)</td></tr>
         <tr><td>Heute Min/Max:</td><td>{heute_min} °C / {heute_max} °C</td></tr>
         <tr><td>Taupunkt:</td><td>{cur['dew_point_2m']} °C</td></tr>
         <tr><td>Luftfeuchtigkeit:</td><td>{cur['relative_humidity_2m']} %</td></tr>
-        <tr><td>Wind:</td><td>{cur['windspeed_10m']} km/h</td></tr>
+        <tr><td>Luftdruck:</td><td>{luftdruck or f"{cur.get('surface_pressure','-')} hPa"}</td></tr>
+        <tr><td>Wind:</td><td>{cur['windspeed_10m']} km/h, Böen {cur.get('windgusts_10m','-')} km/h, aus {windrichtung}</td></tr>
+        <tr><td>UV-Index (Tagesmax):</td><td>{uv_index if uv_index is not None else '-'}</td></tr>
+        <tr><td>Sonnenscheindauer heute:</td><td>{sonnenschein_std:.1f} Std.</td></tr>
         <tr><td>Niederschlag aktuell:</td><td>{cur['precipitation']} mm</td></tr>
         <tr><td>Sonnenaufgang / -untergang:</td><td>{sonnenaufgang} / {sonnenuntergang}</td></tr>
       </table>
+      {klimavergleich_html}
       <h3>Verlauf nächste 24h</h3>
       <img src="cid:diagramm" width="600">
       <h3>7-Tage-Modellvergleich (GFS / ECMWF / AIFS / ICON)</h3>
@@ -409,7 +685,7 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
       {trend_block}
       <p style="color:#888; font-size:12px;">
         Automatisch erstellt am {datetime.now().strftime('%d.%m.%Y um %H:%M Uhr')}.
-        Datenquelle: Open-Meteo.
+        Datenquelle: Open-Meteo, DWD.
       </p>
     </body>
     </html>
@@ -417,9 +693,10 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
 
 
 def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: str,
-                taupunkt_pfad: str, trend_pfad: str = None):
+                taupunkt_pfad: str, trend_pfad: str = None, betreff_praefix: str = ""):
     msg = MIMEMultipart("related")
-    msg["Subject"] = f"Wetter-Update {ort_name} - {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    zeitstempel = datetime.now().strftime('%d.%m.%Y %H:%M')
+    msg["Subject"] = f"{betreff_praefix}Wetter-Update {ort_name} - {zeitstempel}"
     msg["From"] = GMAIL_ADRESSE
     msg["To"] = EMPFAENGER
     msg.attach(MIMEText(html, "html", "utf-8"))
@@ -448,6 +725,23 @@ def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: st
         server.sendmail(GMAIL_ADRESSE, EMPFAENGER, msg.as_string())
 
 
+def berechne_betreff_praefix(daily: dict, warnungen: list) -> str:
+    """Auffälliger Betreff-Prefix, wenn diese Woche Extremwerte oder aktive DWD-Warnungen vorliegen."""
+    if warnungen:
+        hoechste_stufe = max(w["level"] for w in warnungen)
+        if hoechste_stufe >= 3:
+            return "🔴 UNWETTERWARNUNG - "
+        return "🟠 Wetterwarnung - "
+
+    max_werte = [v for v in daily.get("temperature_2m_max", []) if v is not None]
+    min_werte = [v for v in daily.get("temperature_2m_min", []) if v is not None]
+    if max_werte and max(max_werte) >= 35:
+        return "🌡️ Extreme Hitze - "
+    if min_werte and min(min_werte) < 0:
+        return "❄️ Frost - "
+    return ""
+
+
 def main():
     try:
         lat, lon, ort_name = geocode(ORT)
@@ -465,8 +759,9 @@ def main():
         erstelle_modelltemperaturdiagramm(vergleich, modelltemp_pfad)
         erstelle_taupunktdiagramm(daten, taupunkt_pfad)
 
-        # Langfrist-Trend ist optional: schlägt diese API mal fehl, soll die
-        # restliche Mail trotzdem verschickt werden.
+        # Die folgenden drei Zusatz-Features sind optional: schlägt eine
+        # dieser APIs mal fehl, soll die restliche Mail trotzdem verschickt
+        # werden.
         hat_trend = False
         try:
             saison_daten = hole_langfristtrend(lat, lon)
@@ -475,9 +770,26 @@ def main():
         except Exception as e:
             print(f"Hinweis: Langfrist-Trend konnte nicht geladen werden: {e}", file=sys.stderr)
 
-        html = baue_html(ort_name, daten, modellvergleich_html, hat_trend)
+        warnungen = []
+        try:
+            warnungen = hole_dwd_warnungen(lat, lon)
+        except Exception as e:
+            print(f"Hinweis: DWD-Warnungen konnten nicht geladen werden: {e}", file=sys.stderr)
+
+        klimavergleich = None
+        try:
+            klimavergleich = hole_klimavergleich(
+                lat, lon,
+                daten["daily"]["temperature_2m_max"][0],
+                daten["daily"]["temperature_2m_min"][0],
+            )
+        except Exception as e:
+            print(f"Hinweis: Klimavergleich konnte nicht geladen werden: {e}", file=sys.stderr)
+
+        betreff_praefix = berechne_betreff_praefix(daten["daily"], warnungen)
+        html = baue_html(ort_name, daten, modellvergleich_html, hat_trend, warnungen, klimavergleich)
         sende_mail(ort_name, html, diagramm_pfad, modelltemp_pfad, taupunkt_pfad,
-                   trend_pfad if hat_trend else None)
+                   trend_pfad if hat_trend else None, betreff_praefix)
         print(f"Wetter-Mail für {ort_name} erfolgreich versendet.")
     except Exception as e:
         print(f"Fehler beim Versenden der Wetter-Mail: {e}", file=sys.stderr)
