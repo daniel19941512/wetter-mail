@@ -118,7 +118,7 @@ def hole_wetterdaten(lat: float, lon: float):
                    "dew_point_2m,precipitation,weathercode,windspeed_10m,"
                    "windgusts_10m,winddirection_10m,surface_pressure",
         "hourly": "temperature_2m,precipitation,precipitation_probability,"
-                  "dew_point_2m,surface_pressure",
+                  "dew_point_2m,surface_pressure,weathercode,cape",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,"
                  "sunrise,sunset,weathercode,uv_index_max,sunshine_duration",
         "forecast_days": 7,
@@ -406,6 +406,23 @@ def wettercode_text(code: int) -> str:
     return WETTERCODES.get(code, f"Code {code}")
 
 
+WETTER_EMOJI = {
+    0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️",
+    45: "🌫️", 48: "🌫️",
+    51: "🌦️", 53: "🌦️", 55: "🌦️",
+    61: "🌧️", 63: "🌧️", 65: "🌧️",
+    71: "🌨️", 73: "🌨️", 75: "🌨️",
+    80: "🌦️", 81: "🌧️", 82: "🌧️",
+    95: "⛈️", 96: "⛈️", 99: "⛈️",
+}
+
+
+def wettercode_emoji(code) -> str:
+    if code is None:
+        return "❓"
+    return WETTER_EMOJI.get(code, "❓")
+
+
 def erstelle_diagramm(daten: dict, pfad: str):
     """Temperatur- und Niederschlagsdiagramm für die nächsten 24h."""
     hourly = daten["hourly"]
@@ -429,6 +446,74 @@ def erstelle_diagramm(daten: dict, pfad: str):
     fig.tight_layout()
     fig.savefig(pfad, dpi=120)
     plt.close(fig)
+
+
+def erstelle_cape_diagramm(daten: dict, pfad: str):
+    """CAPE-Verlauf (Gewitterpotential) für die nächsten 48h, mit Einordnungslinien."""
+    hourly = daten["hourly"]
+    cape = hourly.get("cape")
+    if not cape:
+        raise ValueError("Keine CAPE-Daten in der Antwort enthalten.")
+
+    zeiten = [datetime.fromisoformat(t) for t in hourly["time"][:48]]
+    werte = cape[:48]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.fill_between(zeiten, werte, color="#8e24aa", alpha=0.3)
+    ax.plot(zeiten, werte, color="#8e24aa", linewidth=1.5, label="CAPE (J/kg)")
+
+    schwellen = [(1000, "#fbc02d", "gering/moderat"), (2500, "#fb8c00", "stark"),
+                 (4000, "#c62828", "extrem")]
+    for wert, farbe, label in schwellen:
+        ax.axhline(wert, color=farbe, linestyle="--", linewidth=1, alpha=0.7)
+        ax.text(zeiten[-1], wert, f" {wert} ({label})", color=farbe, fontsize=8, va="bottom")
+
+    ax.set_title("CAPE - Gewitterpotential (nächste 48h)")
+    ax.set_ylabel("CAPE (J/kg)")
+    ax.set_xlabel("Uhrzeit")
+    ax.set_ylim(bottom=0)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(pfad, dpi=120)
+    plt.close(fig)
+
+
+def baue_stundenverlauf_tabelle(daten: dict, stunden: int = 24, schritt: int = 2) -> str:
+    """
+    HTML-Tabelle: Stundenverlauf in 2h-Schritten (Wetter-Symbol, Temperatur,
+    Taupunkt, Niederschlag), beginnend bei der aktuellsten verfügbaren Stunde.
+    """
+    hourly = daten["hourly"]
+    zeiten_roh = hourly["time"]
+
+    # Index der aktuellen/nächsten Stunde finden
+    jetzt = datetime.now()
+    start_index = 0
+    for i, t in enumerate(zeiten_roh):
+        if datetime.fromisoformat(t) >= jetzt:
+            start_index = i
+            break
+
+    zeilen = ["<tr><th>Uhrzeit</th><th>Wetter</th><th>Temp.</th><th>Taupunkt</th><th>Niederschlag</th></tr>"]
+    anzahl_schritte = stunden // schritt
+    for n in range(anzahl_schritte):
+        i = start_index + n * schritt
+        if i >= len(zeiten_roh):
+            break
+        zeit = datetime.fromisoformat(zeiten_roh[i]).strftime("%a %H:%M")
+        symbol = wettercode_emoji(hourly.get("weathercode", [None])[i] if i < len(hourly.get("weathercode", [])) else None)
+        temp = hourly["temperature_2m"][i]
+        taupunkt = hourly["dew_point_2m"][i]
+        regen = hourly["precipitation"][i]
+        zeilen.append(
+            f"<tr><td>{zeit}</td><td style='font-size:18px;'>{symbol}</td>"
+            f"<td>{temp:.0f}°C</td><td>{taupunkt:.0f}°C</td><td>{regen:.1f} mm</td></tr>"
+        )
+
+    return (
+        "<table cellpadding='4' style='border-collapse:collapse; font-size:13px;' border='1'>"
+        + "".join(zeilen) + "</table>"
+    )
 
 
 def erstelle_trenddiagramm(saison_daten: dict, pfad: str):
@@ -641,6 +726,7 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
     klartext = baue_klartext(daten, klimavergleich, warnungen)
     warnungen_html = baue_warnungen_html(warnungen)
     klimavergleich_html = baue_klimavergleich_html(klimavergleich)
+    stundenverlauf_html = baue_stundenverlauf_tabelle(daten)
 
     trend_block = ""
     if hat_trend:
@@ -674,6 +760,8 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
         <tr><td>Sonnenaufgang / -untergang:</td><td>{sonnenaufgang} / {sonnenuntergang}</td></tr>
       </table>
       {klimavergleich_html}
+      <h3>Stundenverlauf (2h-Schritte)</h3>
+      {stundenverlauf_html}
       <h3>Verlauf nächste 24h</h3>
       <img src="cid:diagramm" width="600">
       <h3>7-Tage-Modellvergleich (GFS / ECMWF / AIFS / ICON)</h3>
@@ -682,6 +770,8 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
       <img src="cid:modelltemp" width="600">
       <h3>Taupunktverlauf</h3>
       <img src="cid:taupunkt" width="600">
+      <h3>CAPE - Gewitterpotential (48h)</h3>
+      <img src="cid:cape" width="600">
       {trend_block}
       <p style="color:#888; font-size:12px;">
         Automatisch erstellt am {datetime.now().strftime('%d.%m.%Y um %H:%M Uhr')}.
@@ -693,7 +783,7 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
 
 
 def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: str,
-                taupunkt_pfad: str, trend_pfad: str = None, betreff_praefix: str = ""):
+                taupunkt_pfad: str, cape_pfad: str, trend_pfad: str = None, betreff_praefix: str = ""):
     msg = MIMEMultipart("related")
     zeitstempel = datetime.now().strftime('%d.%m.%Y %H:%M')
     msg["Subject"] = f"{betreff_praefix}Wetter-Update {ort_name} - {zeitstempel}"
@@ -705,6 +795,7 @@ def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: st
         (diagramm_pfad, "diagramm"),
         (modelltemp_pfad, "modelltemp"),
         (taupunkt_pfad, "taupunkt"),
+        (cape_pfad, "cape"),
     ]
     for pfad, cid in bilder:
         with open(pfad, "rb") as f:
@@ -758,11 +849,13 @@ def main():
         diagramm_pfad = os.path.join(tmp, "wetter_diagramm.png")
         modelltemp_pfad = os.path.join(tmp, "wetter_modelltemp.png")
         taupunkt_pfad = os.path.join(tmp, "wetter_taupunkt.png")
+        cape_pfad = os.path.join(tmp, "wetter_cape.png")
         trend_pfad = os.path.join(tmp, "wetter_trend.png")
 
         erstelle_diagramm(daten, diagramm_pfad)
         erstelle_modelltemperaturdiagramm(vergleich, modelltemp_pfad)
         erstelle_taupunktdiagramm(daten, taupunkt_pfad)
+        erstelle_cape_diagramm(daten, cape_pfad)
 
         # Die folgenden drei Zusatz-Features sind optional: schlägt eine
         # dieser APIs mal fehl, soll die restliche Mail trotzdem verschickt
@@ -793,7 +886,7 @@ def main():
 
         betreff_praefix = berechne_betreff_praefix(daten["daily"], warnungen)
         html = baue_html(ort_name, daten, modellvergleich_html, hat_trend, warnungen, klimavergleich)
-        sende_mail(ort_name, html, diagramm_pfad, modelltemp_pfad, taupunkt_pfad,
+        sende_mail(ort_name, html, diagramm_pfad, modelltemp_pfad, taupunkt_pfad, cape_pfad,
                    trend_pfad if hat_trend else None, betreff_praefix)
         print(f"Wetter-Mail für {ort_name} erfolgreich versendet.")
     except Exception as e:
