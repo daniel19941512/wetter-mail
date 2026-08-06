@@ -726,15 +726,20 @@ def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: st
 
 
 def berechne_betreff_praefix(daily: dict, warnungen: list) -> str:
-    """Auffälliger Betreff-Prefix, wenn diese Woche Extremwerte oder aktive DWD-Warnungen vorliegen."""
+    """
+    Auffälliger Betreff-Prefix bei aktiven DWD-Warnungen oder Extremwerten.
+    Hitze/Frost wird bewusst nur für heute + morgen geprüft (nicht die ganze
+    7-Tage-Woche), da die Mail mehrmals täglich verschickt wird und der
+    Betreff so nah am aktuellen/nächsten Tag bleiben soll.
+    """
     if warnungen:
         hoechste_stufe = max(w["level"] for w in warnungen)
         if hoechste_stufe >= 3:
             return "🔴 UNWETTERWARNUNG - "
         return "🟠 Wetterwarnung - "
 
-    max_werte = [v for v in daily.get("temperature_2m_max", []) if v is not None]
-    min_werte = [v for v in daily.get("temperature_2m_min", []) if v is not None]
+    max_werte = [v for v in daily.get("temperature_2m_max", [])[:2] if v is not None]
+    min_werte = [v for v in daily.get("temperature_2m_min", [])[:2] if v is not None]
     if max_werte and max(max_werte) >= 35:
         return "🌡️ Extreme Hitze - "
     if min_werte and min(min_werte) < 0:
