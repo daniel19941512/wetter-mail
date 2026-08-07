@@ -18,6 +18,8 @@ on:
 jobs:
   send-weather-mail:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # nötig, damit der Workflow letzte_vorhersage.json zurück ins Repo committen darf
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
@@ -37,3 +39,15 @@ jobs:
           GMAIL_APP_PASSWORT: ${{ secrets.GMAIL_APP_PASSWORT }}
           WETTER_EMPFAENGER: ${{ secrets.WETTER_EMPFAENGER }}
         run: python wetter_mail.py
+
+      - name: Vorhersage-Historie speichern (für den Vergleich beim nächsten Lauf)
+        run: |
+          if [ -n "$(git status --porcelain letzte_vorhersage.json)" ]; then
+            git config user.name "Wetter-Mail Bot"
+            git config user.email "actions@github.com"
+            git add letzte_vorhersage.json
+            git commit -m "Vorhersage-Historie aktualisieren [skip ci]"
+            git push
+          else
+            echo "Keine Änderung an der Vorhersage-Historie."
+          fi
