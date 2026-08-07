@@ -921,23 +921,6 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
       <p style="color:#888; font-size:11px;">Quelle: RainViewer. Zeigt die aktuellste verfügbare
       Niederschlagsradar-Aufnahme, überlagert auf einer OpenStreetMap-Basiskarte.</p>"""
 
-    # Inhaltsverzeichnis mit Sprungmarken - passt sich an, welche optionalen
-    # Abschnitte in dieser Mail überhaupt vorhanden sind.
-    toc_eintraege = [
-        ("#stundenverlauf", "Stundenverlauf"),
-        ("#verlauf24h", "Verlauf nächste 24h"),
-        ("#modellvergleich", "7-Tage-Modellvergleich"),
-        ("#modelltemp", "Temperaturverlauf (Modelle)"),
-        ("#gefuehlt", "Gefühlte Temperatur (7 Tage)"),
-        ("#taupunkt", "Taupunktverlauf"),
-        ("#cape", "CAPE (Gewitterpotential)"),
-    ]
-    if hat_radar:
-        toc_eintraege.append(("#radar", "Regenradar"))
-    if hat_trend:
-        toc_eintraege.append(("#trend", "Langfrist-Trend"))
-    toc_html = " · ".join(f'<a href="{href}" style="color:#1565c0;">{label}</a>' for href, label in toc_eintraege)
-
     return f"""
     <html>
     <body style="font-family: Arial, sans-serif; color:#222;">
@@ -945,9 +928,6 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
       {wochenuebersicht_html}
       <p style="font-size:15px;">{klartext}</p>
       {vorhersage_vergleich_html}
-      <p style="font-size:12px; background:#f5f5f5; padding:8px; border-radius:4px;">
-        <b>Inhalt:</b> {toc_html}
-      </p>
       <h3>Amtliche Warnungen (DWD)</h3>
       {warnungen_html}
       <table cellpadding="4">
