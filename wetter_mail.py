@@ -23,12 +23,15 @@ import tempfile
 import os
 import csv
 import json
+import math
+import io
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 
 import requests
+from PIL import Image
 import matplotlib
 matplotlib.use("Agg")  # kein Display nötig, wichtig für Cron/Task Scheduler
 import matplotlib.pyplot as plt
@@ -120,7 +123,8 @@ def hole_wetterdaten(lat: float, lon: float):
         "hourly": "temperature_2m,precipitation,precipitation_probability,"
                   "dew_point_2m,surface_pressure,weathercode,cape",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,"
-                 "sunrise,sunset,weathercode,uv_index_max,sunshine_duration",
+                 "sunrise,sunset,weathercode,uv_index_max,sunshine_duration,"
+                 "apparent_temperature_max,apparent_temperature_min",
         "forecast_days": 7,
         "timezone": "auto",
     }
@@ -478,6 +482,61 @@ def erstelle_cape_diagramm(daten: dict, pfad: str):
     plt.close(fig)
 
 
+def _latlon_zu_kachel(lat, lon, zoom):
+    lat_rad = math.radians(lat)
+    n = 2.0 ** zoom
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+    return x, y
+
+
+def lade_regenradar(lat: float, lon: float, pfad: str, zoom: int = 8):
+    """
+    Regenradar-Kompositbild: OpenStreetMap-Kacheln als Basiskarte, darüber
+    die aktuellste Niederschlagsradar-Kachel von RainViewer (kostenlos,
+    kein API-Key). Zeigt ein 3x3-Kachelraster um den Standort.
+    Optionales Feature - Fehler werden in main() abgefangen.
+    """
+    headers = {"User-Agent": "WetterMail/1.0 (privates Automatisierungsskript)"}
+
+    # Aktuellsten Radar-Frame-Pfad von RainViewer holen
+    meta = requests.get("https://api.rainviewer.com/public/weather-maps.json",
+                         headers=headers, timeout=15)
+    meta.raise_for_status()
+    frames = meta.json().get("radar", {}).get("past", [])
+    if not frames:
+        raise ValueError("Keine aktuellen Radar-Frames von RainViewer verfügbar.")
+    radar_pfad = frames[-1]["path"]
+
+    tile_groesse = 256
+    raster = 3
+    mitte = raster // 2
+    x0, y0 = _latlon_zu_kachel(lat, lon, zoom)
+
+    gesamt = Image.new("RGB", (tile_groesse * raster, tile_groesse * raster), color="white")
+
+    for dx in range(-mitte, mitte + 1):
+        for dy in range(-mitte, mitte + 1):
+            x, y = x0 + dx, y0 + dy
+            # Basiskarte (OpenStreetMap)
+            basis_url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+            r = requests.get(basis_url, headers=headers, timeout=15)
+            r.raise_for_status()
+            basis_kachel = Image.open(io.BytesIO(r.content)).convert("RGBA")
+
+            # Niederschlagsradar-Kachel (Farbschema 2 = Universal Blue, mit Glättung)
+            radar_url = f"https://tilecache.rainviewer.com{radar_pfad}/256/{zoom}/{x}/{y}/2/1_1.png"
+            rr = requests.get(radar_url, headers=headers, timeout=15)
+            if rr.status_code == 200 and rr.content:
+                radar_kachel = Image.open(io.BytesIO(rr.content)).convert("RGBA")
+                basis_kachel = Image.alpha_composite(basis_kachel, radar_kachel)
+
+            gesamt.paste(basis_kachel.convert("RGB"),
+                         ((dx + mitte) * tile_groesse, (dy + mitte) * tile_groesse))
+
+    gesamt.save(pfad)
+
+
 def baue_stundenverlauf_tabelle(daten: dict, stunden: int = 24, schritt: int = 2) -> str:
     """
     HTML-Tabelle: Stundenverlauf in 2h-Schritten (Wetter-Symbol, Temperatur,
@@ -666,6 +725,30 @@ def erstelle_taupunktdiagramm(daten: dict, pfad: str):
     plt.close(fig)
 
 
+def erstelle_gefuehlte_temp_diagramm(daten: dict, pfad: str):
+    """Gefühlte Temperatur (Max/Min) im 7-Tage-Verlauf."""
+    daily = daten["daily"]
+    tage = [datetime.fromisoformat(t) for t in daily["time"]]
+    labels = [t.strftime("%a %d.%m.") for t in tage]
+    gef_max = daily.get("apparent_temperature_max")
+    gef_min = daily.get("apparent_temperature_min")
+    if not gef_max or not gef_min:
+        raise ValueError("Keine Daten zur gefühlten Temperatur in der Antwort enthalten.")
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(labels, gef_max, marker="o", linewidth=2, color="#d84315", label="Gefühlt Max")
+    ax.plot(labels, gef_min, marker="o", linewidth=2, color="#1565c0", label="Gefühlt Min")
+    ax.fill_between(labels, gef_min, gef_max, color="#ffab91", alpha=0.2)
+
+    ax.set_title("Gefühlte Temperatur - 7-Tage-Verlauf")
+    ax.set_ylabel("Gefühlte Temperatur (°C)")
+    ax.legend(loc="upper left", fontsize=9)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(pfad, dpi=120)
+    plt.close(fig)
+
+
 def baue_klartext(daten: dict, vergleich: dict, warnungen: list) -> str:
     """Regelbasierter Klartext-Bericht in einem Satz/Absatz (kein LLM, rein aus den Zahlen abgeleitet)."""
     cur = daten["current"]
@@ -710,8 +793,97 @@ def baue_klartext(daten: dict, vergleich: dict, warnungen: list) -> str:
     return " ".join(teile)
 
 
+def baue_wochenuebersicht_html(daten: dict) -> str:
+    """Kompakte 7-Tage-Mini-Übersicht (Symbol + Min/Max) für den Anfang der Mail."""
+    daily = daten["daily"]
+    tage = daily["time"]
+    zellen = []
+    for i, tag in enumerate(tage):
+        datum = datetime.fromisoformat(tag).strftime("%a")
+        symbol = wettercode_emoji(daily.get("weathercode", [None] * len(tage))[i])
+        max_t = daily["temperature_2m_max"][i]
+        min_t = daily["temperature_2m_min"][i]
+        zellen.append(
+            f"<td style='text-align:center; padding:6px 10px;'>"
+            f"<div style='font-size:12px; color:#555;'>{datum}</div>"
+            f"<div style='font-size:22px;'>{symbol}</div>"
+            f"<div style='font-size:12px;'><b>{max_t:.0f}°</b>/{min_t:.0f}°</div></td>"
+        )
+    return (
+        "<table cellpadding='0' cellspacing='0' style='border-collapse:collapse; margin:8px 0;'>"
+        "<tr>" + "".join(zellen) + "</tr></table>"
+    )
+
+
+VORHERSAGE_HISTORIE_DATEI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "letzte_vorhersage.json")
+
+
+def lade_letzte_vorhersage():
+    """Liest die beim letzten Lauf gespeicherte Vorhersage (falls vorhanden)."""
+    try:
+        with open(VORHERSAGE_HISTORIE_DATEI, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def speichere_vorhersage(daten: dict):
+    """Speichert die aktuelle Vorhersage für den Vergleich beim nächsten Lauf."""
+    daily = daten["daily"]
+    inhalt = {
+        "zeitstempel": datetime.now().isoformat(),
+        "tage": {
+            tag: {"max": daily["temperature_2m_max"][i], "min": daily["temperature_2m_min"][i]}
+            for i, tag in enumerate(daily["time"])
+        },
+    }
+    with open(VORHERSAGE_HISTORIE_DATEI, "w", encoding="utf-8") as f:
+        json.dump(inhalt, f, ensure_ascii=False, indent=2)
+
+
+def baue_vorhersage_vergleich_html(alt: dict, daten: dict) -> str:
+    """
+    Vergleicht die heutige Vorhersage (erster Tag) mit der beim letzten Lauf
+    gespeicherten Vorhersage für denselben Kalendertag.
+    """
+    if not alt:
+        return ""
+    daily = daten["daily"]
+    heute = daily["time"][0]
+    alte_werte = alt.get("tage", {}).get(heute)
+    if not alte_werte:
+        return ""
+
+    neu_max = daily["temperature_2m_max"][0]
+    neu_min = daily["temperature_2m_min"][0]
+    diff_max = neu_max - alte_werte["max"]
+    diff_min = neu_min - alte_werte["min"]
+
+    if abs(diff_max) < 0.5 and abs(diff_min) < 0.5:
+        return ""  # keine nennenswerte Änderung - nichts anzeigen
+
+    try:
+        alter_zeitstempel = datetime.fromisoformat(alt["zeitstempel"]).strftime("%H:%M Uhr")
+    except (KeyError, ValueError):
+        alter_zeitstempel = "letztem Lauf"
+
+    def richtungstext(diff):
+        return f"{abs(diff):.1f}°C {'wärmer' if diff > 0 else 'kälter'}"
+
+    teile = []
+    if abs(diff_max) >= 0.5:
+        teile.append(f"Tagesmax jetzt {richtungstext(diff_max)} ({alte_werte['max']:.0f}°C → {neu_max:.0f}°C)")
+    if abs(diff_min) >= 0.5:
+        teile.append(f"Nachtmin jetzt {richtungstext(diff_min)} ({alte_werte['min']:.0f}°C → {neu_min:.0f}°C)")
+
+    return (
+        f"<p style='background:#fff8e1; padding:8px 12px; border-left:4px solid #fbc02d;'>"
+        f"<b>Änderung seit {alter_zeitstempel}:</b> {', '.join(teile)}.</p>"
+    )
+
+
 def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: bool,
-              warnungen: list, klimavergleich: dict) -> str:
+              warnungen: list, klimavergleich: dict, hat_radar: bool, alte_vorhersage: dict) -> str:
     cur = daten["current"]
     daily = daten["daily"]
     heute_max = daily["temperature_2m_max"][0]
@@ -727,11 +899,13 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
     warnungen_html = baue_warnungen_html(warnungen)
     klimavergleich_html = baue_klimavergleich_html(klimavergleich)
     stundenverlauf_html = baue_stundenverlauf_tabelle(daten)
+    wochenuebersicht_html = baue_wochenuebersicht_html(daten)
+    vorhersage_vergleich_html = baue_vorhersage_vergleich_html(alte_vorhersage, daten)
 
     trend_block = ""
     if hat_trend:
         trend_block = """
-      <h3>Langfrist-Trend (ECMWF EC46, bis 46 Tage)</h3>
+      <h3 id="trend">Langfrist-Trend (ECMWF EC46, bis 46 Tage)</h3>
       <img src="cid:trend" width="600">
       <p style="color:#888; font-size:11px;">
         NOAA CFS ist über die kostenlose Open-Meteo-API nicht verfügbar. Diese Ansicht nutzt
@@ -739,11 +913,41 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
         bias-korrigiert - als grobe Tendenz zu verstehen, nicht als Tagesvorhersage.
       </p>"""
 
+    radar_block = ""
+    if hat_radar:
+        radar_block = """
+      <h3 id="radar">Regenradar</h3>
+      <img src="cid:radar" width="600">
+      <p style="color:#888; font-size:11px;">Quelle: RainViewer. Zeigt die aktuellste verfügbare
+      Niederschlagsradar-Aufnahme, überlagert auf einer OpenStreetMap-Basiskarte.</p>"""
+
+    # Inhaltsverzeichnis mit Sprungmarken - passt sich an, welche optionalen
+    # Abschnitte in dieser Mail überhaupt vorhanden sind.
+    toc_eintraege = [
+        ("#stundenverlauf", "Stundenverlauf"),
+        ("#verlauf24h", "Verlauf nächste 24h"),
+        ("#modellvergleich", "7-Tage-Modellvergleich"),
+        ("#modelltemp", "Temperaturverlauf (Modelle)"),
+        ("#gefuehlt", "Gefühlte Temperatur (7 Tage)"),
+        ("#taupunkt", "Taupunktverlauf"),
+        ("#cape", "CAPE (Gewitterpotential)"),
+    ]
+    if hat_radar:
+        toc_eintraege.append(("#radar", "Regenradar"))
+    if hat_trend:
+        toc_eintraege.append(("#trend", "Langfrist-Trend"))
+    toc_html = " · ".join(f'<a href="{href}" style="color:#1565c0;">{label}</a>' for href, label in toc_eintraege)
+
     return f"""
     <html>
     <body style="font-family: Arial, sans-serif; color:#222;">
       <h2>Wetter für {ort_name}</h2>
+      {wochenuebersicht_html}
       <p style="font-size:15px;">{klartext}</p>
+      {vorhersage_vergleich_html}
+      <p style="font-size:12px; background:#f5f5f5; padding:8px; border-radius:4px;">
+        <b>Inhalt:</b> {toc_html}
+      </p>
       <h3>Amtliche Warnungen (DWD)</h3>
       {warnungen_html}
       <table cellpadding="4">
@@ -760,22 +964,26 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
         <tr><td>Sonnenaufgang / -untergang:</td><td>{sonnenaufgang} / {sonnenuntergang}</td></tr>
       </table>
       {klimavergleich_html}
-      <h3>Stundenverlauf (2h-Schritte)</h3>
+      {radar_block}
+      <h3 id="stundenverlauf">Stundenverlauf (2h-Schritte)</h3>
       {stundenverlauf_html}
-      <h3>Verlauf nächste 24h</h3>
+      <h3 id="verlauf24h">Verlauf nächste 24h</h3>
       <img src="cid:diagramm" width="600">
-      <h3>7-Tage-Modellvergleich (GFS / ECMWF / AIFS / ICON)</h3>
+      <h3 id="modellvergleich">7-Tage-Modellvergleich (GFS / ECMWF / AIFS / ICON)</h3>
       {modellvergleich_html}
-      <h3>7-Tage-Temperaturverlauf im Modellvergleich</h3>
+      <h3 id="modelltemp">7-Tage-Temperaturverlauf im Modellvergleich</h3>
       <img src="cid:modelltemp" width="600">
-      <h3>Taupunktverlauf</h3>
+      <h3 id="gefuehlt">Gefühlte Temperatur - 7-Tage-Verlauf</h3>
+      <img src="cid:gefuehlt" width="600">
+      <h3 id="taupunkt">Taupunktverlauf</h3>
       <img src="cid:taupunkt" width="600">
-      <h3>CAPE - Gewitterpotential (48h)</h3>
+      <h3 id="cape">CAPE - Gewitterpotential (48h)</h3>
       <img src="cid:cape" width="600">
       {trend_block}
       <p style="color:#888; font-size:12px;">
         Automatisch erstellt am {datetime.now().strftime('%d.%m.%Y um %H:%M Uhr')}.
         Datenquelle: Open-Meteo, DWD.
+
       </p>
     </body>
     </html>
@@ -783,7 +991,8 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
 
 
 def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: str,
-                taupunkt_pfad: str, cape_pfad: str, trend_pfad: str = None, betreff_praefix: str = ""):
+                taupunkt_pfad: str, cape_pfad: str, gefuehlt_pfad: str,
+                trend_pfad: str = None, radar_pfad: str = None, betreff_praefix: str = ""):
     msg = MIMEMultipart("related")
     zeitstempel = datetime.now().strftime('%d.%m.%Y %H:%M')
     msg["Subject"] = f"{betreff_praefix}Wetter-Update {ort_name} - {zeitstempel}"
@@ -796,6 +1005,7 @@ def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: st
         (modelltemp_pfad, "modelltemp"),
         (taupunkt_pfad, "taupunkt"),
         (cape_pfad, "cape"),
+        (gefuehlt_pfad, "gefuehlt"),
     ]
     for pfad, cid in bilder:
         with open(pfad, "rb") as f:
@@ -803,11 +1013,13 @@ def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: st
             bild.add_header("Content-ID", f"<{cid}>")
             msg.attach(bild)
 
-    if trend_pfad and os.path.exists(trend_pfad):
-        with open(trend_pfad, "rb") as f:
-            bild = MIMEImage(f.read())
-            bild.add_header("Content-ID", "<trend>")
-            msg.attach(bild)
+    optionale_bilder = [(trend_pfad, "trend"), (radar_pfad, "radar")]
+    for pfad, cid in optionale_bilder:
+        if pfad and os.path.exists(pfad):
+            with open(pfad, "rb") as f:
+                bild = MIMEImage(f.read())
+                bild.add_header("Content-ID", f"<{cid}>")
+                msg.attach(bild)
 
     kontext = ssl.create_default_context()
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
@@ -850,16 +1062,19 @@ def main():
         modelltemp_pfad = os.path.join(tmp, "wetter_modelltemp.png")
         taupunkt_pfad = os.path.join(tmp, "wetter_taupunkt.png")
         cape_pfad = os.path.join(tmp, "wetter_cape.png")
+        gefuehlt_pfad = os.path.join(tmp, "wetter_gefuehlt.png")
         trend_pfad = os.path.join(tmp, "wetter_trend.png")
+        radar_pfad = os.path.join(tmp, "wetter_radar.png")
 
         erstelle_diagramm(daten, diagramm_pfad)
         erstelle_modelltemperaturdiagramm(vergleich, modelltemp_pfad)
         erstelle_taupunktdiagramm(daten, taupunkt_pfad)
         erstelle_cape_diagramm(daten, cape_pfad)
+        erstelle_gefuehlte_temp_diagramm(daten, gefuehlt_pfad)
 
-        # Die folgenden drei Zusatz-Features sind optional: schlägt eine
-        # dieser APIs mal fehl, soll die restliche Mail trotzdem verschickt
-        # werden.
+        # Die folgenden Zusatz-Features sind optional: schlägt eine dieser
+        # externen APIs mal fehl, soll die restliche Mail trotzdem
+        # verschickt werden.
         hat_trend = False
         try:
             saison_daten = hole_langfristtrend(lat, lon)
@@ -867,6 +1082,13 @@ def main():
             hat_trend = True
         except Exception as e:
             print(f"Hinweis: Langfrist-Trend konnte nicht geladen werden: {e}", file=sys.stderr)
+
+        hat_radar = False
+        try:
+            lade_regenradar(lat, lon, radar_pfad)
+            hat_radar = True
+        except Exception as e:
+            print(f"Hinweis: Regenradar konnte nicht geladen werden: {e}", file=sys.stderr)
 
         warnungen = []
         try:
@@ -884,11 +1106,24 @@ def main():
         except Exception as e:
             print(f"Hinweis: Klimavergleich konnte nicht geladen werden: {e}", file=sys.stderr)
 
+        alte_vorhersage = None
+        try:
+            alte_vorhersage = lade_letzte_vorhersage()
+        except Exception as e:
+            print(f"Hinweis: Vorhersage-Historie konnte nicht geladen werden: {e}", file=sys.stderr)
+
         betreff_praefix = berechne_betreff_praefix(daten["daily"], warnungen)
-        html = baue_html(ort_name, daten, modellvergleich_html, hat_trend, warnungen, klimavergleich)
+        html = baue_html(ort_name, daten, modellvergleich_html, hat_trend, warnungen,
+                          klimavergleich, hat_radar, alte_vorhersage)
         sende_mail(ort_name, html, diagramm_pfad, modelltemp_pfad, taupunkt_pfad, cape_pfad,
-                   trend_pfad if hat_trend else None, betreff_praefix)
+                   gefuehlt_pfad, trend_pfad if hat_trend else None,
+                   radar_pfad if hat_radar else None, betreff_praefix)
         print(f"Wetter-Mail für {ort_name} erfolgreich versendet.")
+
+        try:
+            speichere_vorhersage(daten)
+        except Exception as e:
+            print(f"Hinweis: Vorhersage-Historie konnte nicht gespeichert werden: {e}", file=sys.stderr)
     except Exception as e:
         print(f"Fehler beim Versenden der Wetter-Mail: {e}", file=sys.stderr)
         sys.exit(1)
