@@ -629,10 +629,20 @@ def _max_temp_farbe(wert):
 
 
 def _min_temp_farbe(wert):
-    """Kälte-Markierung für Min-Temperaturen: unter 5° = blau (Frost-Risiko)."""
-    if wert is not None and wert < 5:
-        return "#1565c0", "white"
-    return None
+    """
+    Farbskala für Min-Temperaturen (Nachtwerte): unter 10° = Grün,
+    10-19° = Blau, 20-29° = Hellblau, ab 30° = Gelb.
+    """
+    if wert is None:
+        return None
+    if wert >= 30:
+        return "#f9a825", "#222"    # Gelb
+    elif wert >= 20:
+        return "#4fc3f7", "#222"    # Hellblau
+    elif wert >= 10:
+        return "#1565c0", "white"   # Blau
+    else:
+        return "#2e7d32", "white"   # Grün
 
 
 def baue_modellvergleich_tabelle(vergleich: dict) -> str:
@@ -715,7 +725,8 @@ def baue_modellvergleich_tabelle(vergleich: dict) -> str:
     return (
         "".join(bloecke)
         + "<p style='color:#888; font-size:11px;'>Max-Temperatur: Gelb ab 30°C, Rot ab 35°C, "
-          "Lila ab 40°C. Min-Temperatur: Blau unter 5°C (Frost-Risiko). "
+          "Lila ab 40°C. Min-Temperatur: Grün unter 10°C, Blau 10-19°C, "
+          "Hellblau 20-29°C, Gelb ab 30°C. "
           "'Ø Mittel' = Durchschnitt über alle vier Modelle.</p>"
     )
 
