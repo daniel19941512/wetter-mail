@@ -793,16 +793,39 @@ def baue_klartext(daten: dict, vergleich: dict, warnungen: list) -> str:
     return " ".join(teile)
 
 
-def baue_wochenuebersicht_html(daten: dict) -> str:
-    """Kompakte 7-Tage-Mini-Übersicht (Symbol + Min/Max) für den Anfang der Mail."""
+def baue_wochenuebersicht_html(daten: dict, vergleich: dict) -> str:
+    """
+    Kompakte 7-Tage-Mini-Übersicht (Symbol + Min/Max) für den Anfang der Mail.
+    Die Temperaturwerte sind der Mittelwert aus allen vier Modellen
+    (GFS/ECMWF/AIFS/ICON) statt nur des einzelnen best_match-Modells (das
+    bei Open-Meteo für Europa meist ICON ist und z.B. bei Hitze manchmal
+    deutlich höher liegt als der Modell-Durchschnitt). Das Wetter-Symbol
+    kommt weiterhin aus der best_match-Vorhersage, da die Modelle im
+    Vergleich keinen Wettercode liefern.
+    """
     daily = daten["daily"]
     tage = daily["time"]
+    vergleich_daily = vergleich.get("daily", {})
+
     zellen = []
     for i, tag in enumerate(tage):
         datum = datetime.fromisoformat(tag).strftime("%a")
         symbol = wettercode_emoji(daily.get("weathercode", [None] * len(tage))[i])
-        max_t = daily["temperature_2m_max"][i]
-        min_t = daily["temperature_2m_min"][i]
+
+        max_werte = [vergleich_daily[f"temperature_2m_max_{suffix}"][i]
+                     for suffix in MODELLE.values()
+                     if f"temperature_2m_max_{suffix}" in vergleich_daily
+                     and i < len(vergleich_daily[f"temperature_2m_max_{suffix}"])
+                     and vergleich_daily[f"temperature_2m_max_{suffix}"][i] is not None]
+        min_werte = [vergleich_daily[f"temperature_2m_min_{suffix}"][i]
+                     for suffix in MODELLE.values()
+                     if f"temperature_2m_min_{suffix}" in vergleich_daily
+                     and i < len(vergleich_daily[f"temperature_2m_min_{suffix}"])
+                     and vergleich_daily[f"temperature_2m_min_{suffix}"][i] is not None]
+
+        max_t = sum(max_werte) / len(max_werte) if max_werte else daily["temperature_2m_max"][i]
+        min_t = sum(min_werte) / len(min_werte) if min_werte else daily["temperature_2m_min"][i]
+
         zellen.append(
             f"<td style='text-align:center; padding:6px 10px;'>"
             f"<div style='font-size:12px; color:#555;'>{datum}</div>"
@@ -882,7 +905,49 @@ def baue_vorhersage_vergleich_html(alt: dict, daten: dict) -> str:
     )
 
 
-def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: bool,
+def baue_tiefstwerttabelle_html(daten: dict) -> str:
+    """
+    Tabelle mit dem gefühlten nächtlichen Tiefstwert pro Tag (7 Tage),
+    farblich markiert: unter 20°C = blau, ab 20°C = gelb, ab 25°C = rot
+    (Einordnung Richtung "Tropennacht" - Schwellen für unruhigen Schlaf).
+    """
+    daily = daten["daily"]
+    tage = daily["time"]
+    gef_min = daily.get("apparent_temperature_min")
+    if not gef_min:
+        return ""
+
+    def farbe_fuer(wert):
+        if wert >= 25:
+            return "#c62828", "white"   # Rot
+        elif wert >= 20:
+            return "#f9a825", "#222"    # Gelb
+        else:
+            return "#1565c0", "white"   # Blau
+
+    zeilen = ["<tr><th>Datum</th><th>Gefühlter Nachttiefstwert</th></tr>"]
+    for i, tag in enumerate(tage):
+        if i >= len(gef_min) or gef_min[i] is None:
+            continue
+        datum = datetime.fromisoformat(tag).strftime("%a %d.%m.")
+        wert = gef_min[i]
+        hg_farbe, text_farbe = farbe_fuer(wert)
+        zeilen.append(
+            f"<tr><td>{datum}</td>"
+            f"<td style='background:{hg_farbe}; color:{text_farbe}; font-weight:bold; "
+            f"text-align:center;'>{wert:.0f}°C</td></tr>"
+        )
+
+    return (
+        "<h3>Gefühlter Nacht-Tiefstwert (7 Tage)</h3>"
+        "<table cellpadding='6' style='border-collapse:collapse; font-size:13px;' border='1'>"
+        + "".join(zeilen) + "</table>"
+        "<p style='color:#888; font-size:11px;'>Blau = unter 20°C, Gelb = ab 20°C, "
+        "Rot = ab 25°C (Tropennacht-Bereich, oft unruhiger Schlaf).</p>"
+    )
+
+
+def baue_html(ort_name: str, daten: dict, vergleich: dict, modellvergleich_html: str, hat_trend: bool,
               warnungen: list, klimavergleich: dict, hat_radar: bool, alte_vorhersage: dict) -> str:
     cur = daten["current"]
     daily = daten["daily"]
@@ -899,7 +964,8 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
     warnungen_html = baue_warnungen_html(warnungen)
     klimavergleich_html = baue_klimavergleich_html(klimavergleich)
     stundenverlauf_html = baue_stundenverlauf_tabelle(daten)
-    wochenuebersicht_html = baue_wochenuebersicht_html(daten)
+    wochenuebersicht_html = baue_wochenuebersicht_html(daten, vergleich)
+    tiefstwerttabelle_html = baue_tiefstwerttabelle_html(daten)
     vorhersage_vergleich_html = baue_vorhersage_vergleich_html(alte_vorhersage, daten)
 
     trend_block = ""
@@ -960,6 +1026,7 @@ def baue_html(ort_name: str, daten: dict, modellvergleich_html: str, hat_trend: 
       <h3 id="cape">CAPE - Gewitterpotential (48h)</h3>
       <img src="cid:cape" width="600">
       {trend_block}
+      {tiefstwerttabelle_html}
       <p style="color:#888; font-size:12px;">
         Automatisch erstellt am {datetime.now().strftime('%d.%m.%Y um %H:%M Uhr')}.
         Datenquelle: Open-Meteo, DWD.
@@ -1093,7 +1160,7 @@ def main():
             print(f"Hinweis: Vorhersage-Historie konnte nicht geladen werden: {e}", file=sys.stderr)
 
         betreff_praefix = berechne_betreff_praefix(daten["daily"], warnungen)
-        html = baue_html(ort_name, daten, modellvergleich_html, hat_trend, warnungen,
+        html = baue_html(ort_name, daten, vergleich, modellvergleich_html, hat_trend, warnungen,
                           klimavergleich, hat_radar, alte_vorhersage)
         sende_mail(ort_name, html, diagramm_pfad, modelltemp_pfad, taupunkt_pfad, cape_pfad,
                    gefuehlt_pfad, trend_pfad if hat_trend else None,
