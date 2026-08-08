@@ -612,59 +612,111 @@ def erstelle_trenddiagramm(saison_daten: dict, pfad: str):
     plt.close(fig)
 
 
+MODELL_FARBEN = {"GFS": "#2e7d32", "ECMWF": "#1565c0", "AIFS": "#6a1b9a", "ICON": "#e65100"}
+
+
+def _max_temp_farbe(wert):
+    """Hitze-Farbskala für Max-Temperaturen: ab 30°=gelb, 35°=rot, 40°=lila."""
+    if wert is None:
+        return None
+    if wert >= 40:
+        return "#8e24aa", "white"
+    elif wert >= 35:
+        return "#c62828", "white"
+    elif wert >= 30:
+        return "#f9a825", "#222"
+    return None
+
+
+def _min_temp_farbe(wert):
+    """Kälte-Markierung für Min-Temperaturen: unter 5° = blau (Frost-Risiko)."""
+    if wert is not None and wert < 5:
+        return "#1565c0", "white"
+    return None
+
+
 def baue_modellvergleich_tabelle(vergleich: dict) -> str:
-    """HTML-Tabelle: 7-Tage-Vorhersage im Modellvergleich (Max/Min-Temp, Niederschlag)."""
+    """
+    HTML-Übersicht: 7-Tage-Vorhersage im Modellvergleich. Statt einer breiten
+    10-Spalten-Tabelle (auf dem Handy unübersichtlich) gibt es pro Tag einen
+    kompakten Block mit einer Zeile je Modell (farbig nach Anbieter) plus
+    einer hervorgehobenen Mittelwert-Zeile. Temperaturen sind farblich nach
+    Hitze/Kälte markiert.
+    """
     daily = vergleich["daily"]
     tage = daily["time"]
-
-    zeilen = []
-    kopf = "<tr><th>Datum</th>"
-    for name in MODELLE:
-        kopf += f"<th colspan='2'>{name}</th>"
-    kopf += "<th colspan='2'>Mittel aller Modelle</th><th>Niederschlag Ø</th></tr>"
-    zeilen.append(kopf)
-    zeilen.append(
-        "<tr><td></td>" + "<th>Max</th><th>Min (Nacht)</th>" * len(MODELLE)
-        + "<th>Max</th><th>Min (Nacht)</th><td></td></tr>"
-    )
+    bloecke = []
 
     for i, tag in enumerate(tage):
-        datum = datetime.fromisoformat(tag).strftime("%a %d.%m.")
-        zeile = f"<tr><td><b>{datum}</b></td>"
+        datum = datetime.fromisoformat(tag).strftime("%A, %d.%m.")
+        zeilen_html = []
         niederschlag_werte, max_werte, min_werte = [], [], []
-        for suffix in MODELLE.values():
-            max_key = f"temperature_2m_max_{suffix}"
-            min_key = f"temperature_2m_min_{suffix}"
-            regen_key = f"precipitation_sum_{suffix}"
-            max_t = daily.get(max_key, [None] * len(tage))[i]
-            min_t = daily.get(min_key, [None] * len(tage))[i]
-            regen = daily.get(regen_key, [None] * len(tage))[i]
+
+        for name, suffix in MODELLE.items():
+            max_t = daily.get(f"temperature_2m_max_{suffix}", [None] * len(tage))[i]
+            min_t = daily.get(f"temperature_2m_min_{suffix}", [None] * len(tage))[i]
+            regen = daily.get(f"precipitation_sum_{suffix}", [None] * len(tage))[i]
             if regen is not None:
                 niederschlag_werte.append(regen)
             if max_t is not None:
                 max_werte.append(max_t)
             if min_t is not None:
                 min_werte.append(min_t)
+
             max_txt = f"{max_t:.0f}°" if max_t is not None else "-"
             min_txt = f"{min_t:.0f}°" if min_t is not None else "-"
-            # Kälteste Nächte (< 5°C) hervorheben
-            min_style = ' style="color:#1a5fb4; font-weight:bold;"' if (min_t is not None and min_t < 5) else ""
-            zeile += f"<td>{max_txt}</td><td{min_style}>{min_txt}</td>"
+            max_farbe = _max_temp_farbe(max_t)
+            min_farbe = _min_temp_farbe(min_t)
+            max_style = f"background:{max_farbe[0]}; color:{max_farbe[1]}; font-weight:bold;" if max_farbe else ""
+            min_style = f"background:{min_farbe[0]}; color:{min_farbe[1]}; font-weight:bold;" if min_farbe else ""
+            modell_farbe = MODELL_FARBEN.get(name, "#555")
 
-        mittel_max = f"{sum(max_werte)/len(max_werte):.0f}°" if max_werte else "-"
-        mittel_min = f"{sum(min_werte)/len(min_werte):.0f}°" if min_werte else "-"
-        zeile += f"<td><b>{mittel_max}</b></td><td><b>{mittel_min}</b></td>"
+            zeilen_html.append(
+                f"<tr>"
+                f"<td style='background:{modell_farbe}; color:white; font-weight:bold; "
+                f"padding:5px 8px;'>{name}</td>"
+                f"<td style='padding:5px 8px; text-align:center; {max_style}'>{max_txt}</td>"
+                f"<td style='padding:5px 8px; text-align:center; {min_style}'>{min_txt}</td>"
+                f"</tr>"
+            )
 
+        mittel_max = sum(max_werte) / len(max_werte) if max_werte else None
+        mittel_min = sum(min_werte) / len(min_werte) if min_werte else None
+        mittel_max_txt = f"{mittel_max:.0f}°" if mittel_max is not None else "-"
+        mittel_min_txt = f"{mittel_min:.0f}°" if mittel_min is not None else "-"
+        mittel_max_farbe = _max_temp_farbe(mittel_max)
+        mittel_min_farbe = _min_temp_farbe(mittel_min)
+        mittel_max_style = (f"background:{mittel_max_farbe[0]}; color:{mittel_max_farbe[1]};"
+                             if mittel_max_farbe else "")
+        mittel_min_style = (f"background:{mittel_min_farbe[0]}; color:{mittel_min_farbe[1]};"
+                             if mittel_min_farbe else "")
         regen_avg = f"{sum(niederschlag_werte)/len(niederschlag_werte):.1f} mm" if niederschlag_werte else "-"
-        zeile += f"<td>{regen_avg}</td></tr>"
-        zeilen.append(zeile)
+
+        zeilen_html.append(
+            f"<tr style='background:#eeeeee; font-weight:bold;'>"
+            f"<td style='padding:5px 8px;'>Ø Mittel</td>"
+            f"<td style='padding:5px 8px; text-align:center; {mittel_max_style}'>{mittel_max_txt}</td>"
+            f"<td style='padding:5px 8px; text-align:center; {mittel_min_style}'>{mittel_min_txt}</td>"
+            f"</tr>"
+        )
+
+        bloecke.append(
+            f"<div style='margin-bottom:14px;'>"
+            f"<div style='font-weight:bold; padding:4px 0;'>{datum} "
+            f"<span style='font-weight:normal; color:#666; font-size:12px;'>"
+            f"(Niederschlag Ø {regen_avg})</span></div>"
+            f"<table cellpadding='0' cellspacing='0' style='border-collapse:collapse; width:100%; "
+            f"max-width:360px; font-size:13px;' border='1'>"
+            f"<tr><th style='padding:5px 8px;'>Modell</th><th style='padding:5px 8px;'>Max</th>"
+            f"<th style='padding:5px 8px;'>Min (Nacht)</th></tr>"
+            + "".join(zeilen_html) + "</table></div>"
+        )
 
     return (
-        "<table cellpadding='4' style='border-collapse:collapse; font-size:13px;' border='1'>"
-        + "".join(zeilen) + "</table>"
-        + "<p style='color:#888; font-size:11px;'>Min-Werte unter 5°C sind hervorgehoben "
-          "(relevant für Nachtfrost-Risiko). 'Mittel aller Modelle' und Niederschlag Ø = "
-          "Durchschnitt über alle vier Modelle.</p>"
+        "".join(bloecke)
+        + "<p style='color:#888; font-size:11px;'>Max-Temperatur: Gelb ab 30°C, Rot ab 35°C, "
+          "Lila ab 40°C. Min-Temperatur: Blau unter 5°C (Frost-Risiko). "
+          "'Ø Mittel' = Durchschnitt über alle vier Modelle.</p>"
     )
 
 
