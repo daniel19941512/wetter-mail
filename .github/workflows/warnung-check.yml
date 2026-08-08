@@ -1,0 +1,46 @@
+name: Unwetterwarnung-Check
+
+on:
+  schedule:
+    # Alle 30 Minuten - unabhängig vom 3x-täglichen Wetter-Mail-Workflow.
+    # Bei Bedarf auf z.B. "*/15 * * * *" (alle 15 Min) verkürzen, dafür
+    # einfach die Zahl vor dem ersten "*" anpassen.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}  # erlaubt manuelles Auslösen über den "Run workflow" Button
+
+jobs:
+  check-warnungen:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # nötig, damit gesehene_warnungen.json zurück ins Repo committet werden darf
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Auf neue Unwetterwarnungen prüfen
+        env:
+          WETTER_ORT: ${{ secrets.WETTER_ORT }}
+          GMAIL_ADRESSE: ${{ secrets.GMAIL_ADRESSE }}
+          GMAIL_APP_PASSWORT: ${{ secrets.GMAIL_APP_PASSWORT }}
+          WETTER_EMPFAENGER: ${{ secrets.WETTER_EMPFAENGER }}
+        run: python warnung_check.py
+
+      - name: Warnungs-Historie speichern
+        run: |
+          if [ -n "$(git status --porcelain gesehene_warnungen.json)" ]; then
+            git config user.name "Wetter-Mail Bot"
+            git config user.email "actions@github.com"
+            git add gesehene_warnungen.json
+            git commit -m "Warnungs-Historie aktualisieren [skip ci]"
+            git push
+          else
+            echo "Keine Änderung an der Warnungs-Historie."
+          fi
