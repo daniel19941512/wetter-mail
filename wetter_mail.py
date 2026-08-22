@@ -1106,50 +1106,248 @@ def baue_html(ort_name: str, daten: dict, vergleich: dict, modellvergleich_html:
     """
 
 
-def sende_telegram(ort_name: str, daten: dict, warnungen: list, betreff_praefix: str, diagramm_pfad: str = None):
+def _chunke_telegram_text(bloecke: list, limit: int = 3500) -> list:
     """
-    Verschickt eine kompakte Textzusammenfassung zusätzlich per Telegram-Bot
-    (plus das 24h-Diagramm als Bild, falls vorhanden). Komplett optional -
-    wird stillschweigend übersprungen, wenn kein Bot-Token/Chat-ID gesetzt
-    ist. Kein parse_mode (Markdown), damit Sonderzeichen/Emojis nie zu
+    Fügt Text-Blöcke zu Nachrichten unter der Telegram-Zeichengrenze
+    zusammen. Blöcke werden möglichst nicht mitten durchgeschnitten - nur
+    wenn ein einzelner Block selbst zu lang ist, wird er zeilenweise geteilt.
+    """
+    nachrichten = []
+    aktuell = ""
+    for block in bloecke:
+        if not block:
+            continue
+        kandidat = f"{aktuell}\n\n{block}" if aktuell else block
+        if len(kandidat) <= limit:
+            aktuell = kandidat
+            continue
+        if aktuell:
+            nachrichten.append(aktuell)
+            aktuell = ""
+        if len(block) <= limit:
+            aktuell = block
+            continue
+        teil = ""
+        for zeile in block.split("\n"):
+            kandidat2 = f"{teil}\n{zeile}" if teil else zeile
+            if len(kandidat2) <= limit:
+                teil = kandidat2
+            else:
+                if teil:
+                    nachrichten.append(teil)
+                teil = zeile
+        aktuell = teil
+    if aktuell:
+        nachrichten.append(aktuell)
+    return nachrichten
+
+
+def baue_vorhersage_vergleich_text(alt: dict, daten: dict) -> str:
+    """Textvariante von baue_vorhersage_vergleich_html (für Telegram)."""
+    if not alt:
+        return ""
+    daily = daten["daily"]
+    heute = daily["time"][0]
+    alte_werte = alt.get("tage", {}).get(heute)
+    if not alte_werte:
+        return ""
+    neu_max = daily["temperature_2m_max"][0]
+    neu_min = daily["temperature_2m_min"][0]
+    diff_max = neu_max - alte_werte["max"]
+    diff_min = neu_min - alte_werte["min"]
+    if abs(diff_max) < 0.5 and abs(diff_min) < 0.5:
+        return ""
+    try:
+        alter_zeitstempel = datetime.fromisoformat(alt["zeitstempel"]).strftime("%H:%M Uhr")
+    except (KeyError, ValueError):
+        alter_zeitstempel = "letztem Lauf"
+
+    def richtungstext(diff):
+        return f"{abs(diff):.1f}°C {'wärmer' if diff > 0 else 'kälter'}"
+
+    teile = []
+    if abs(diff_max) >= 0.5:
+        teile.append(f"Tagesmax jetzt {richtungstext(diff_max)} ({alte_werte['max']:.0f}°C -> {neu_max:.0f}°C)")
+    if abs(diff_min) >= 0.5:
+        teile.append(f"Nachtmin jetzt {richtungstext(diff_min)} ({alte_werte['min']:.0f}°C -> {neu_min:.0f}°C)")
+    return f"Änderung seit {alter_zeitstempel}: " + ", ".join(teile)
+
+
+def baue_telegram_stundenverlauf_text(daten: dict, stunden: int = 24, schritt: int = 2) -> str:
+    """Textvariante der Stundenverlauf-Tabelle (für Telegram)."""
+    hourly = daten["hourly"]
+    zeiten_roh = hourly["time"]
+    jetzt = datetime.now()
+    start_index = 0
+    for i, t in enumerate(zeiten_roh):
+        if datetime.fromisoformat(t) >= jetzt:
+            start_index = i
+            break
+
+    zeilen = ["Stundenverlauf (2h-Schritte):"]
+    for n in range(stunden // schritt):
+        i = start_index + n * schritt
+        if i >= len(zeiten_roh):
+            break
+        zeit = datetime.fromisoformat(zeiten_roh[i]).strftime("%a %H:%M")
+        wc_liste = hourly.get("weathercode", [])
+        symbol = wettercode_emoji(wc_liste[i] if i < len(wc_liste) else None)
+        temp = hourly["temperature_2m"][i]
+        taupunkt = hourly["dew_point_2m"][i]
+        regen = hourly["precipitation"][i]
+        zeilen.append(f"{zeit}  {symbol}  {temp:.0f}°C  Taupunkt {taupunkt:.0f}°C  Regen {regen:.1f}mm")
+    return "\n".join(zeilen)
+
+
+def baue_telegram_modellvergleich_text(vergleich: dict) -> str:
+    """Textvariante der Modellvergleich-Tabelle (für Telegram)."""
+    daily = vergleich["daily"]
+    tage = daily["time"]
+    tagesbloecke = []
+    for i, tag in enumerate(tage):
+        datum = datetime.fromisoformat(tag).strftime("%a %d.%m.")
+        zeilen = [f"{datum}:"]
+        max_werte, min_werte, regen_werte = [], [], []
+        for name, suffix in MODELLE.items():
+            max_t = daily.get(f"temperature_2m_max_{suffix}", [None] * len(tage))[i]
+            min_t = daily.get(f"temperature_2m_min_{suffix}", [None] * len(tage))[i]
+            regen = daily.get(f"precipitation_sum_{suffix}", [None] * len(tage))[i]
+            if max_t is not None:
+                max_werte.append(max_t)
+            if min_t is not None:
+                min_werte.append(min_t)
+            if regen is not None:
+                regen_werte.append(regen)
+            werte_txt = f"{max_t:.0f}°/{min_t:.0f}°" if max_t is not None and min_t is not None else "-"
+            zeilen.append(f"  {name}: {werte_txt}")
+        if max_werte and min_werte:
+            mittel_max = sum(max_werte) / len(max_werte)
+            mittel_min = sum(min_werte) / len(min_werte)
+            zeilen.append(f"  Ø Mittel: {mittel_max:.0f}°/{mittel_min:.0f}°")
+        if regen_werte:
+            zeilen.append(f"  Niederschlag Ø: {sum(regen_werte)/len(regen_werte):.1f}mm")
+        tagesbloecke.append("\n".join(zeilen))
+    return "7-Tage-Modellvergleich (GFS/ECMWF/AIFS/ICON):\n\n" + "\n\n".join(tagesbloecke)
+
+
+def baue_telegram_tiefstwert_text(daten: dict) -> str:
+    """Textvariante der Tiefstwert-Tabelle (für Telegram)."""
+    daily = daten["daily"]
+    tage = daily["time"]
+    gef_min = daily.get("apparent_temperature_min")
+    if not gef_min:
+        return ""
+    zeilen = ["Gefühlter Nacht-Tiefstwert (7 Tage):"]
+    for i, tag in enumerate(tage):
+        if i >= len(gef_min) or gef_min[i] is None:
+            continue
+        datum = datetime.fromisoformat(tag).strftime("%a %d.%m.")
+        wert = gef_min[i]
+        symbol = "🔴" if wert >= 25 else "🟡" if wert >= 20 else "🔵"
+        zeilen.append(f"{datum}: {symbol} {wert:.0f}°C")
+    return "\n".join(zeilen)
+
+
+def sende_telegram(ort_name: str, daten: dict, vergleich: dict, warnungen: list,
+                    klimavergleich: dict, alte_vorhersage: dict, betreff_praefix: str,
+                    bilder: list):
+    """
+    Verschickt den kompletten Inhalt der Wetter-Mail zusätzlich per
+    Telegram-Bot: alle Textabschnitte (in mehreren Nachrichten, da Telegram
+    eine Nachricht auf ~4096 Zeichen begrenzt) sowie alle Diagramme als
+    Fotos mit Bildunterschrift. Komplett optional - wird stillschweigend
+    übersprungen, wenn kein Bot-Token/Chat-ID gesetzt ist. Kein parse_mode
+    (Markdown), damit Sonderzeichen/Emojis nie zu
     "can't parse entities"-Fehlern führen.
+
+    bilder: Liste aus (dateipfad, bildunterschrift) - Einträge mit
+    dateipfad=None oder nicht existierender Datei werden übersprungen.
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     cur = daten["current"]
     daily = daten["daily"]
+    tage = daily["time"]
     heute_max = daily["temperature_2m_max"][0]
     heute_min = daily["temperature_2m_min"][0]
+    uv_index = daily.get("uv_index_max", [None])[0]
+    sonnenschein_std = (daily.get("sunshine_duration", [0])[0] or 0) / 3600
+    luftdruck = luftdruck_trend(daten["hourly"])
+    windrichtung = windrichtung_text(cur["winddirection_10m"]) if cur.get("winddirection_10m") is not None else "-"
 
-    zeilen = [f"{betreff_praefix}Wetter {ort_name}".strip()]
-    zeilen.append(f"{wettercode_emoji(cur.get('weathercode'))} {wettercode_text(cur['weathercode'])}, "
-                  f"aktuell {cur['temperature_2m']}°C")
-    zeilen.append(f"Heute: {heute_min:.0f}°C / {heute_max:.0f}°C")
+    luftdruck_text = luftdruck or f"{cur.get('surface_pressure', '-')} hPa"
 
-    if warnungen:
-        hoechste_stufe = max(w_["level"] for w_ in warnungen)
-        zeilen.append(f"⚠️ {DWD_WARNSTUFEN.get(hoechste_stufe, 'Warnung')}: {warnungen[0]['headline']}")
+    # --- Block 1: Kopf mit Klartext + aktuelle Werte ---
+    kopf = [f"{betreff_praefix}Wetter {ort_name}".strip()]
+    kopf.append(baue_klartext(daten, klimavergleich, warnungen))
+    kopf.append("")
+    kopf.append(f"Aktuell: {cur['temperature_2m']}°C (gefühlt {cur['apparent_temperature']}°C)")
+    kopf.append(f"Heute Min/Max: {heute_min}°C / {heute_max}°C")
+    kopf.append(f"Taupunkt: {cur['dew_point_2m']}°C")
+    kopf.append(f"Luftfeuchtigkeit: {cur['relative_humidity_2m']}%")
+    kopf.append(f"Luftdruck: {luftdruck_text}")
+    kopf.append(f"Wind: {cur['windspeed_10m']} km/h, Böen {cur.get('windgusts_10m', '-')} km/h, aus {windrichtung}")
+    kopf.append(f"UV-Index: {uv_index if uv_index is not None else '-'}")
+    kopf.append(f"Sonnenschein heute: {sonnenschein_std:.1f} Std.")
+    kopf.append(f"Sonnenauf-/untergang: {daily['sunrise'][0].split('T')[1]} / {daily['sunset'][0].split('T')[1]}")
+    block_kopf = "\n".join(kopf)
 
-    tage = daily["time"]
-    tage_zeile = []
+    # --- Block 2: 7-Tage-Mini-Übersicht ---
+    tage_zeile = ["7-Tage-Übersicht:"]
     for i, tag in enumerate(tage):
         datum = datetime.fromisoformat(tag).strftime("%a")
         symbol = wettercode_emoji(daily.get("weathercode", [None] * len(tage))[i])
         tage_zeile.append(f"{datum} {symbol} {daily['temperature_2m_max'][i]:.0f}°/{daily['temperature_2m_min'][i]:.0f}°")
-    zeilen.append(" | ".join(tage_zeile))
+    block_wochenuebersicht = " | ".join(tage_zeile)
 
-    text = "\n".join(zeilen)
+    # --- Block 3: Vorhersage-Vergleich (nur bei Änderung) ---
+    block_vergleich = baue_vorhersage_vergleich_text(alte_vorhersage, daten)
+
+    # --- Block 4: DWD-Warnungen ---
+    if warnungen:
+        warnzeilen = ["⚠️ Amtliche DWD-Warnungen:"]
+        for w_ in warnungen:
+            stufe = DWD_WARNSTUFEN.get(w_["level"], "Warnung")
+            warnzeilen.append(f"- {stufe}: {w_['headline']}")
+            warnzeilen.append(f"  {w_['beschreibung']}")
+        block_warnungen = "\n".join(warnzeilen)
+    else:
+        block_warnungen = "Keine amtlichen DWD-Warnungen aktiv."
+
+    # --- Block 5: Klimavergleich ---
+    block_klima = ""
+    if klimavergleich:
+        a_max, a_min = klimavergleich["anomalie_max"], klimavergleich["anomalie_min"]
+        r_max = "wärmer" if a_max >= 0 else "kälter"
+        r_min = "wärmer" if a_min >= 0 else "kälter"
+        block_klima = (
+            f"Vergleich zu den letzten {klimavergleich['jahre']} Jahren: "
+            f"Tagesmax {abs(a_max):.1f}°C {r_max}, Nachtmin {abs(a_min):.1f}°C {r_min}"
+        )
+
+    # --- Block 6-8: Stundenverlauf, Modellvergleich, Tiefstwerte ---
+    block_stundenverlauf = baue_telegram_stundenverlauf_text(daten)
+    block_modellvergleich = baue_telegram_modellvergleich_text(vergleich)
+    block_tiefstwerte = baue_telegram_tiefstwert_text(daten)
+
+    alle_bloecke = [
+        block_kopf, block_wochenuebersicht, block_vergleich, block_warnungen,
+        block_klima, block_stundenverlauf, block_modellvergleich, block_tiefstwerte,
+    ]
+
     basis_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    for text in _chunke_telegram_text(alle_bloecke):
+        r = requests.post(f"{basis_url}/sendMessage",
+                           data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+        r.raise_for_status()
 
-    r = requests.post(f"{basis_url}/sendMessage",
-                       data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
-    r.raise_for_status()
-
-    if diagramm_pfad and os.path.exists(diagramm_pfad):
-        with open(diagramm_pfad, "rb") as f:
+    for pfad, bildunterschrift in bilder:
+        if not pfad or not os.path.exists(pfad):
+            continue
+        with open(pfad, "rb") as f:
             r2 = requests.post(f"{basis_url}/sendPhoto",
-                                data={"chat_id": TELEGRAM_CHAT_ID},
+                                data={"chat_id": TELEGRAM_CHAT_ID, "caption": bildunterschrift},
                                 files={"photo": f}, timeout=30)
             r2.raise_for_status()
 
@@ -1285,7 +1483,19 @@ def main():
         print(f"Wetter-Mail für {ort_name} erfolgreich versendet.")
 
         try:
-            sende_telegram(ort_name, daten, warnungen, betreff_praefix, diagramm_pfad)
+            telegram_bilder = [
+                (diagramm_pfad, "Verlauf nächste 24h"),
+                (modelltemp_pfad, "7-Tage-Temperaturverlauf (Modellvergleich)"),
+                (gefuehlt_pfad, "Gefühlte Temperatur - 7-Tage-Verlauf"),
+                (taupunkt_pfad, "Taupunktverlauf"),
+                (cape_pfad, "CAPE - Gewitterpotential (48h)"),
+            ]
+            if hat_radar:
+                telegram_bilder.append((radar_pfad, "Regenradar"))
+            if hat_trend:
+                telegram_bilder.append((trend_pfad, "Langfrist-Trend (ECMWF EC46)"))
+            sende_telegram(ort_name, daten, vergleich, warnungen, klimavergleich,
+                            alte_vorhersage, betreff_praefix, telegram_bilder)
         except Exception as e:
             print(f"Hinweis: Telegram-Nachricht konnte nicht gesendet werden: {e}", file=sys.stderr)
 
