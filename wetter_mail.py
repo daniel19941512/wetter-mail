@@ -50,6 +50,12 @@ GMAIL_ADRESSE = os.environ.get("GMAIL_ADRESSE", "deine.adresse@gmail.com")
 GMAIL_APP_PASSWORT = os.environ.get("GMAIL_APP_PASSWORT", "xxxx xxxx xxxx xxxx")
 EMPFAENGER = os.environ.get("WETTER_EMPFAENGER", "empfaenger@example.com")
 
+# Telegram ist optional: leer lassen (oder Secrets nicht setzen), um nur per
+# Mail zu versenden. Bot-Token über @BotFather erstellen, Chat-ID z.B. über
+# @userinfobot herausfinden.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # ============================================================
 
 
@@ -1100,6 +1106,54 @@ def baue_html(ort_name: str, daten: dict, vergleich: dict, modellvergleich_html:
     """
 
 
+def sende_telegram(ort_name: str, daten: dict, warnungen: list, betreff_praefix: str, diagramm_pfad: str = None):
+    """
+    Verschickt eine kompakte Textzusammenfassung zusätzlich per Telegram-Bot
+    (plus das 24h-Diagramm als Bild, falls vorhanden). Komplett optional -
+    wird stillschweigend übersprungen, wenn kein Bot-Token/Chat-ID gesetzt
+    ist. Kein parse_mode (Markdown), damit Sonderzeichen/Emojis nie zu
+    "can't parse entities"-Fehlern führen.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    cur = daten["current"]
+    daily = daten["daily"]
+    heute_max = daily["temperature_2m_max"][0]
+    heute_min = daily["temperature_2m_min"][0]
+
+    zeilen = [f"{betreff_praefix}Wetter {ort_name}".strip()]
+    zeilen.append(f"{wettercode_emoji(cur.get('weathercode'))} {wettercode_text(cur['weathercode'])}, "
+                  f"aktuell {cur['temperature_2m']}°C")
+    zeilen.append(f"Heute: {heute_min:.0f}°C / {heute_max:.0f}°C")
+
+    if warnungen:
+        hoechste_stufe = max(w_["level"] for w_ in warnungen)
+        zeilen.append(f"⚠️ {DWD_WARNSTUFEN.get(hoechste_stufe, 'Warnung')}: {warnungen[0]['headline']}")
+
+    tage = daily["time"]
+    tage_zeile = []
+    for i, tag in enumerate(tage):
+        datum = datetime.fromisoformat(tag).strftime("%a")
+        symbol = wettercode_emoji(daily.get("weathercode", [None] * len(tage))[i])
+        tage_zeile.append(f"{datum} {symbol} {daily['temperature_2m_max'][i]:.0f}°/{daily['temperature_2m_min'][i]:.0f}°")
+    zeilen.append(" | ".join(tage_zeile))
+
+    text = "\n".join(zeilen)
+    basis_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+    r = requests.post(f"{basis_url}/sendMessage",
+                       data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+    r.raise_for_status()
+
+    if diagramm_pfad and os.path.exists(diagramm_pfad):
+        with open(diagramm_pfad, "rb") as f:
+            r2 = requests.post(f"{basis_url}/sendPhoto",
+                                data={"chat_id": TELEGRAM_CHAT_ID},
+                                files={"photo": f}, timeout=30)
+            r2.raise_for_status()
+
+
 def sende_mail(ort_name: str, html: str, diagramm_pfad: str, modelltemp_pfad: str,
                 taupunkt_pfad: str, cape_pfad: str, gefuehlt_pfad: str,
                 trend_pfad: str = None, radar_pfad: str = None, betreff_praefix: str = ""):
@@ -1229,6 +1283,11 @@ def main():
                    gefuehlt_pfad, trend_pfad if hat_trend else None,
                    radar_pfad if hat_radar else None, betreff_praefix)
         print(f"Wetter-Mail für {ort_name} erfolgreich versendet.")
+
+        try:
+            sende_telegram(ort_name, daten, warnungen, betreff_praefix, diagramm_pfad)
+        except Exception as e:
+            print(f"Hinweis: Telegram-Nachricht konnte nicht gesendet werden: {e}", file=sys.stderr)
 
         try:
             speichere_vorhersage(daten)
