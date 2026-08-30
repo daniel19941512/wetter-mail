@@ -3,16 +3,14 @@ name: Wetter-Mail
 on:
   schedule:
     # Uhrzeiten in UTC! Aktuell Sommerzeit (CEST = UTC+2), daher:
-    # 4:30 UTC  -> 6:30 Uhr deutsche Zeit
-    # 10:30 UTC -> 12:30 Uhr deutsche Zeit
-    # 16:30 UTC -> 18:30 Uhr deutsche Zeit
+    # 4:00 UTC  -> 6:00 Uhr deutsche Zeit
+    # 16:00 UTC -> 18:00 Uhr deutsche Zeit
     # WICHTIG: Im Winter (CET = UTC+1) verschieben sich die deutschen Zeiten
-    # dadurch um 1h nach hinten (z.B. 7:30 statt 6:30). Zur Zeitumstellung
-    # (Ende Oktober / Ende März) hier die drei Stunden-Werte um je 1
-    # anpassen: Winterzeit -> "30 5", "30 11", "30 17".
-    - cron: "30 4 * * *"
-    - cron: "30 10 * * *"
-    - cron: "30 16 * * *"
+    # dadurch um 1h nach hinten (z.B. 7:00 statt 6:00). Zur Zeitumstellung
+    # (Ende Oktober / Ende März) hier die zwei Stunden-Werte um je 1
+    # anpassen: Winterzeit -> "0 5", "0 17".
+    - cron: "0 4 * * *"
+    - cron: "0 16 * * *"
   workflow_dispatch: {}  # erlaubt manuelles Auslösen über den "Run workflow" Button
 
 jobs:
